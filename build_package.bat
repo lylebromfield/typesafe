@@ -37,6 +37,10 @@ REM Copy executable to root
 echo [INFO] Copying typesafe.exe to root...
 copy /y "target\release\typesafe.exe" ".\typesafe.exe"
 
+REM Generate icon from SVG if present
+echo [INFO] Generating icon.png...
+".\typesafe.exe" --gen-icon
+
 REM Copy Tectonic and Pdfium to target/release for standalone running
 echo [INFO] Populating target/release...
 if exist "deps\tectonic.exe" (
@@ -67,5 +71,22 @@ if exist "deps\pdfium.dll" (
     copy /y "deps\pdfium.dll" ".\pdfium.dll"
 )
 
-echo [SUCCESS] Build complete. Executable available in project root and target/release.
+REM Create distribution archive
+echo [INFO] Creating distribution archive...
+if exist "release_dist" rmdir /s /q "release_dist"
+mkdir "release_dist"
+mkdir "release_dist\web"
+
+echo Copying release files...
+copy /y "target\release\typesafe.exe" "release_dist\"
+if exist "deps\tectonic.exe" copy /y "deps\tectonic.exe" "release_dist\"
+if exist "deps\pdfium.dll" copy /y "deps\pdfium.dll" "release_dist\"
+if exist "dictionary.txt" copy /y "dictionary.txt" "release_dist\"
+if exist "web\logo.svg" copy /y "web\logo.svg" "release_dist\web\"
+if exist "icon.png" copy /y "icon.png" "release_dist\"
+
+echo Zipping release...
+powershell Compress-Archive -Path "release_dist\*" -DestinationPath "typesafe_v0.2.0.zip" -Force
+
+echo [SUCCESS] Build complete. Archive created at typesafe_v0.2.0.zip
 endlocal

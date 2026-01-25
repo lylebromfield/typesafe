@@ -1,0 +1,5 @@
+{
+  "name": "Typesafe",
+  "description": "A modern, open-source Rust LaTeX editing application.",
+  "requestFramePermissions": []
+}

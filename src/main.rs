@@ -17,6 +17,7 @@ use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 use flate2::read::GzDecoder;
 use std::io::Read;
+use resvg::usvg::{TreeParsing, TreeTextToPath};
 
 const INDENT_UNIT: &str = "    ";
 
@@ -3396,7 +3397,50 @@ fn render_pdf_page_to_texture(
 }
 
 fn load_icon() -> Option<egui::IconData> {
-    let icon_path = if std::path::Path::new("icon.png").exists() {
+    // Try to update icon from SVG if present
+    let svg_path = std::path::Path::new("web/logo.svg");
+    let png_path = std::path::Path::new("icon.png");
+
+    if svg_path.exists() {
+        let should_update = if !png_path.exists() {
+            true
+        } else if let (Ok(m1), Ok(m2)) = (svg_path.metadata(), png_path.metadata()) {
+            if let (Ok(t1), Ok(t2)) = (m1.modified(), m2.modified()) {
+                t1 > t2
+            } else { false }
+        } else { false };
+
+        if should_update {
+            if let Ok(data) = std::fs::read(svg_path) {
+                let opt = resvg::usvg::Options::default();
+                if let Ok(mut tree) = resvg::usvg::Tree::from_data(&data, &opt) {
+                     let mut fontdb = resvg::usvg::fontdb::Database::new();
+                     fontdb.load_system_fonts();
+                     tree.convert_text(&fontdb);
+
+                     let size = tree.size;
+                     let width_f = size.width();
+                     let height_f = size.height();
+
+                     // Target 256px
+                     let target_size = 256.0f32;
+                     let scale = (target_size / width_f).min(target_size / height_f);
+
+                     let width = (width_f * scale).ceil() as u32;
+                     let height = (height_f * scale).ceil() as u32;
+
+                     if let Some(mut pixmap) = resvg::tiny_skia::Pixmap::new(width, height) {
+                         let rtree = resvg::Tree::from_usvg(&tree);
+                         let transform = resvg::tiny_skia::Transform::from_scale(scale, scale);
+                         rtree.render(transform, &mut pixmap.as_mut());
+                         let _ = pixmap.save_png(png_path);
+                     }
+                }
+            }
+        }
+    }
+
+    let icon_path = if png_path.exists() {
         "icon.png"
     } else if std::path::Path::new("deps/icon.png").exists() {
         "deps/icon.png"
@@ -3419,6 +3463,13 @@ fn load_icon() -> Option<egui::IconData> {
 }
 
 fn main() -> Result<(), eframe::Error> {
+    // Check for icon generation flag
+    let args: Vec<String> = std::env::args().collect();
+    if args.contains(&"--gen-icon".to_string()) {
+        let _ = load_icon();
+        return Ok(());
+    }
+
     ensure_fontconfig();
 
     let mut viewport = egui::ViewportBuilder::default()

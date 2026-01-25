@@ -1,7 +1,6 @@
 # Rust Build Artifacts
 /target/
 /dist/
-/web/
 
 # Downloaded Dependencies (Binaries)
 # We track the deps/ folder structure, but not the large binaries it downloads
