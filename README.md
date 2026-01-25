@@ -1,44 +1,58 @@
 # Typesafe
 
-A modern LaTeX editor built with Rust and egui.
+Typesafe is a modern, offline-first LaTeX editor built with Rust and egui. It features a real-time PDF preview, intelligent autocomplete, and a distraction-free writing environment.
 
-## Build Instructions
+## Features
 
-### Windows
+- **Real-time Preview**: Instant feedback as you type (powered by `pdfium`).
+- **Offline-First**: Uses the `tectonic` typesetting engine which manages packages automatically, but the editor itself works fully offline once packages are cached.
+- **Intelligent Autocomplete**:
+  - `\ref{}` triggers a popup of all `\label{}` definitions in your project.
+  - `\cite{}` triggers a popup of bibliography entries from `.bib` files.
+- **Spell Check & Thesaurus**:
+  - **Spell Check**: Uses a local dictionary (`dictionary.txt`) to highlight typos. (Downloaded automatically on first run, ~4MB).
+  - **Thesaurus**: Right-click context menu provides synonyms via the Datamuse API (requires internet connection).
+- **Diagnostics**: Clickable error logs that jump directly to the problematic line.
 
-The build process is automated to download necessary dependencies (Tectonic and PDFium).
+## Building from Source
 
-1. **Build & Package**:
-   Run the included batch script from the project root:
-   ```cmd
-   build_package.bat
-   ```
+To build Typesafe, you need to have **Rust** and **Cargo** installed.
 
-2. **Output**:
-   This will compile the application and place `typesafe.exe` in the project root, alongside the required `pdfium.dll` and `tectonic.exe`.
+1.  **Install Rust**: Visit [rustup.rs](https://rustup.rs/) to install.
+2.  **Clone the Repository**:
+    ```bash
+    git clone https://github.com/yourusername/typesafe.git
+    cd typesafe
+    ```
+3.  **Build**:
+    You can use the included batch script (Windows) or standard cargo commands.
 
-### Linux / macOS
+    **Option A: Windows Batch Script**
+    ```cmd
+    build_package.bat
+    ```
+    This script builds the release binary, copies `tectonic.exe` and `pdfium.dll` from the `deps/` folder (if present), and places everything in the root directory.
 
-On Unix systems, you must provide the dependencies via your system package manager, as the automatic downloader supports Windows only.
+    **Option B: Manual Build**
+    ```bash
+    cargo build --release
+    ```
+    The executable will be located in `target/release/typesafe`.
 
-1. **Install Dependencies**:
-   - **Tectonic**: Install via your package manager (e.g., `apt install tectonic`, `brew install tectonic`).
-   - **PDFium**: Install `libpdfium` development libraries.
+### Runtime Dependencies
 
-2. **Build**:
-   ```bash
-   cargo build --release
-   ```
+Typesafe requires two external binaries to function correctly. These should be placed in the same directory as the executable or in a `deps/` subdirectory:
 
-3. **Output**:
-   The executable will be located at `target/release/typesafe`.
+1.  **Tectonic**: The LaTeX engine.
+    - Windows: `tectonic.exe`
+    - Linux/macOS: `tectonic` (or installed via package manager)
+2.  **PDFium**: The PDF rendering library.
+    - Windows: `pdfium.dll`
+    - Linux: `libpdfium.so`
+    - macOS: `libpdfium.dylib`
 
-## Usage
+*Note: The project includes a helper script `build_package.bat` that attempts to organize these files for you on Windows.*
 
-Run the executable to start the editor.
+## Customization
 
-**Windows Note**: The application requires `tectonic.exe` and `pdfium.dll` to be present in the same directory (or the `deps/` subdirectory) to compile documents and render previews.
-
-## License
-
-MIT
+- **Dictionary**: The app downloads `dictionary.txt` from GitHub on the first launch. You can manually replace this file with any newline-separated word list to change the spell check dictionary.

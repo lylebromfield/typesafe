@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
+use image;
 use egui::{
     Align, Color32, FontId, Frame, Layout, Rounding, Stroke, TextStyle, Vec2, Visuals,
 };
@@ -20,20 +21,18 @@ const INDENT_UNIT: &str = "    ";
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
-// ============================================================================
-// COMPREHENSIVE THEME SYSTEM
-// ============================================================================
+// Themes
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ThemePreset {
-    // Modern themes
+    // Modern
     Serendipity,
     TokyoNight,
     Nord,
     Catppuccin,
     GruvboxDark,
     OneDark,
-    // Classic themes
+    // Classic
     SolarizedDark,
     SolarizedLight,
     Dracula,
@@ -108,7 +107,7 @@ impl ThemeColors {
         }
     }
 
-    // Serendipity - Modern, elegant, inspired by the Serendipity color scheme
+    // Serendipity
     fn serendipity() -> Self {
         Self {
             bg: Color32::from_rgb(0x1a, 0x1f, 0x3a),           // Deep navy
@@ -126,7 +125,7 @@ impl ThemeColors {
         }
     }
 
-    // Tokyo Night - Japanese-inspired dark theme
+    // Tokyo Night
     fn tokyo_night() -> Self {
         Self {
             bg: Color32::from_rgb(0x1a, 0x1b, 0x26),
@@ -144,7 +143,7 @@ impl ThemeColors {
         }
     }
 
-    // Nord - Arctic, north-bluish color palette
+    // Nord
     fn nord() -> Self {
         Self {
             bg: Color32::from_rgb(0x2e, 0x34, 0x40),
@@ -162,7 +161,7 @@ impl ThemeColors {
         }
     }
 
-    // Catppuccin - Soothing pastel color palette
+    // Catppuccin
     fn catppuccin() -> Self {
         Self {
             bg: Color32::from_rgb(0x1e, 0x1e, 0x2e),
@@ -180,7 +179,7 @@ impl ThemeColors {
         }
     }
 
-    // Gruvbox Dark - Retro groove color scheme
+    // Gruvbox Dark
     fn gruvbox_dark() -> Self {
         Self {
             bg: Color32::from_rgb(0x28, 0x28, 0x28),
@@ -198,7 +197,7 @@ impl ThemeColors {
         }
     }
 
-    // OneDark - Atom's One Dark theme
+    // OneDark
     fn one_dark() -> Self {
         Self {
             bg: Color32::from_rgb(0x28, 0x2c, 0x34),
@@ -216,7 +215,7 @@ impl ThemeColors {
         }
     }
 
-    // Solarized Dark - Classic balanced dark theme
+    // Solarized Dark
     fn solarized_dark() -> Self {
         Self {
             bg: Color32::from_rgb(0x00, 0x2b, 0x36),
@@ -234,7 +233,7 @@ impl ThemeColors {
         }
     }
 
-    // Solarized Light - Classic balanced light theme
+    // Solarized Light
     fn solarized_light() -> Self {
         Self {
             bg: Color32::from_rgb(0xfd, 0xf6, 0xe3),
@@ -252,7 +251,7 @@ impl ThemeColors {
         }
     }
 
-    // Dracula - Popular dark purple theme
+    // Dracula
     fn dracula() -> Self {
         Self {
             bg: Color32::from_rgb(0x28, 0x2a, 0x36),
@@ -270,7 +269,7 @@ impl ThemeColors {
         }
     }
 
-    // Light - Clean light theme
+    // Light
     fn light() -> Self {
         Self {
             bg: Color32::from_rgb(0xf5, 0xf5, 0xf5),
@@ -288,7 +287,7 @@ impl ThemeColors {
         }
     }
 
-    // Dark - Clean dark theme
+    // Dark
     fn dark() -> Self {
         Self {
             bg: Color32::from_rgb(0x1e, 0x1e, 0x1e),
@@ -356,9 +355,7 @@ impl AccentColor {
     }
 }
 
-// ============================================================================
-// COMPILATION MESSAGE TYPES
-// ============================================================================
+// Compilation Messages
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PdfFitMode {
@@ -367,23 +364,37 @@ enum PdfFitMode {
     FitPage,
 }
 
+#[derive(Clone, Debug)]
+struct Diagnostic {
+    message: String,
+    line: usize,
+    file: String,
+}
+
 enum CompilationMsg {
     Start,
-    #[allow(dead_code)]
     Log(String),
+    Diagnostics(Vec<Diagnostic>),
     Success(PathBuf),
     Error(String),
 }
 
-// ============================================================================
-// SETTINGS AND APP STATE
-// ============================================================================
+// Settings and App State
+
+#[derive(Clone, PartialEq)]
+enum SettingsTab {
+    Appearance,
+    Permissions,
+    APIs,
+}
 
 #[derive(Clone)]
 struct Settings {
     pub theme: ThemePreset,
     pub accent: AccentColor,
-    pub show_appearance_menu: bool,
+    pub show_settings_window: bool,
+    pub active_tab: SettingsTab,
+    pub auto_compile: bool,
 }
 
 impl Default for Settings {
@@ -391,7 +402,9 @@ impl Default for Settings {
         Self {
             theme: ThemePreset::GruvboxDark,
             accent: AccentColor::Orange,
-            show_appearance_menu: false,
+            show_settings_window: false,
+            active_tab: SettingsTab::Appearance,
+            auto_compile: true,
         }
     }
 }
@@ -411,6 +424,16 @@ struct TypesafeApp {
     root_file: Option<String>,
     show_file_panel: bool,
     outline_items: Vec<OutlineItem>,
+    labels: Vec<String>,
+    bib_items: Vec<String>,
+    context_menu_word: Option<String>,
+    context_menu_suggestions: Vec<String>,
+    context_menu_replace_range: Option<std::ops::Range<usize>>,
+    dictionary: std::collections::HashSet<String>,
+    synonym_cache: std::collections::HashMap<String, Vec<String>>,
+    pending_synonyms: std::collections::HashSet<String>,
+    synonym_rx: Receiver<(String, Vec<String>)>,
+    synonym_tx: Sender<(String, Vec<String>)>,
     is_dirty: bool,
 
     // Command Palette
@@ -447,6 +470,7 @@ struct TypesafeApp {
     compile_rx: Receiver<CompilationMsg>,
     compile_tx: Sender<CompilationMsg>,
     pending_autocompile: bool,
+    diagnostics: Vec<Diagnostic>,
 
     // UI state
     settings: Settings,
@@ -476,6 +500,7 @@ struct TypesafeApp {
 impl Default for TypesafeApp {
     fn default() -> Self {
         let (tx, rx) = unbounded();
+        let (syn_tx, syn_rx) = unbounded();
 
         // Load syntax highlighting data
         let syntax_set = SyntaxSet::load_defaults_newlines();
@@ -503,6 +528,26 @@ impl Default for TypesafeApp {
             "\\documentclass{article}\n\\begin{document}\nHello Typesafe!\n\\end{document}".to_string()
         });
 
+        // Initialize Dictionary
+        let mut dictionary = std::collections::HashSet::new();
+        let dict_path = std::path::Path::new("dictionary.txt");
+        if dict_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(dict_path) {
+                for line in content.lines() {
+                    dictionary.insert(line.trim().to_lowercase());
+                }
+            }
+        } else {
+             // Attempt download in a separate thread
+             std::thread::spawn(|| {
+                 if let Ok(resp) = reqwest::blocking::get("https://raw.githubusercontent.com/dwyl/english-words/master/words_alpha.txt") {
+                     if let Ok(text) = resp.text() {
+                         let _ = std::fs::write("dictionary.txt", &text);
+                     }
+                 }
+             });
+        }
+
         Self {
             editor_content: default_content,
             file_path: default_file,
@@ -510,6 +555,16 @@ impl Default for TypesafeApp {
             root_file: None,
             show_file_panel: true,
             outline_items: Vec::new(),
+            labels: Vec::new(),
+            bib_items: Vec::new(),
+            context_menu_word: None,
+            context_menu_suggestions: Vec::new(),
+            context_menu_replace_range: None,
+            dictionary,
+            synonym_cache: std::collections::HashMap::new(),
+            pending_synonyms: std::collections::HashSet::new(),
+            synonym_rx: syn_rx,
+            synonym_tx: syn_tx,
             is_dirty: false,
             show_command_palette: false,
             cmd_query: String::new(),
@@ -538,6 +593,7 @@ impl Default for TypesafeApp {
             compile_rx: rx,
             compile_tx: tx,
             pending_autocompile: true,
+            diagnostics: Vec::new(),
             settings: Settings::default(),
             completion_suggestions: Vec::new(),
             show_completions: false,
@@ -681,10 +737,35 @@ impl TypesafeApp {
             Ok(_) => {
                 self.is_dirty = false;
                 self.compilation_log = "File saved successfully\n".to_string();
+                self.update_outline();
+                if self.settings.auto_compile {
+                    self.compile();
+                }
             }
             Err(e) => {
                 self.compilation_log = format!("Error saving file: {}\n", e);
             }
+        }
+    }
+
+    fn save_file_as(&mut self) {
+        if let Some(path) = rfd::FileDialog::new().add_filter("LaTeX", &["tex"]).save_file() {
+            self.file_path = path.to_string_lossy().to_string();
+            self.save_file();
+        }
+    }
+
+    fn export_pdf(&mut self) {
+        if let Some(src_path) = &self.pdf_path {
+            if let Some(dst_path) = rfd::FileDialog::new().add_filter("PDF", &["pdf"]).save_file() {
+                match std::fs::copy(src_path, dst_path) {
+                    Ok(_) => self.compilation_log.push_str("PDF exported successfully\n"),
+                    Err(e) => self.compilation_log.push_str(&format!("Error exporting PDF: {}\n", e)),
+                }
+            }
+        } else {
+            self.compilation_log.push_str("No PDF available to export. Please compile first.\n");
+            self.show_log = true;
         }
     }
 
@@ -735,6 +816,29 @@ impl TypesafeApp {
 
             let output = cmd.output();
 
+            if let Ok(out) = &output {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let mut diagnostics = Vec::new();
+                // Regex to find "l.123 context" pattern commonly output by TeX engines
+                let line_regex = regex::Regex::new(r"l\.(\d+)\s+(.*)").unwrap();
+
+                for line in stdout.lines().chain(stderr.lines()) {
+                    if let Some(caps) = line_regex.captures(line) {
+                        if let Ok(line_num) = caps[1].parse::<usize>() {
+                            diagnostics.push(Diagnostic {
+                                line: line_num,
+                                message: caps[2].to_string(),
+                                file: target_path.clone(),
+                            });
+                        }
+                    }
+                }
+                if !diagnostics.is_empty() {
+                     let _ = tx.send(CompilationMsg::Diagnostics(diagnostics));
+                }
+            }
+
             match output {
                 Ok(output) if output.status.success() => {
                     let stem = std::path::Path::new(&target_path).file_stem().unwrap_or_default();
@@ -770,11 +874,15 @@ impl TypesafeApp {
 
     fn update_outline(&mut self) {
         let mut items = Vec::new();
-        // Regex for sections, chapters, etc.
-        let re = regex::Regex::new(r"\\(part|chapter|section|subsection|subsubsection)\*?\{([^}]+)\}").unwrap();
+        let mut labels = Vec::new();
+
+        // Regex for sections
+        let re_section = regex::Regex::new(r"\\(part|chapter|section|subsection|subsubsection)\*?\{([^}]+)\}").unwrap();
+        // Regex for labels
+        let re_label = regex::Regex::new(r"\\label\{([^}]+)\}").unwrap();
 
         for (line_idx, line) in self.editor_content.lines().enumerate() {
-            if let Some(caps) = re.captures(line) {
+            if let Some(caps) = re_section.captures(line) {
                 let type_str = caps.get(1).map_or("", |m| m.as_str());
                 let title = caps.get(2).map_or("", |m| m.as_str());
 
@@ -793,8 +901,34 @@ impl TypesafeApp {
                     level,
                 });
             }
+
+            if let Some(caps) = re_label.captures(line) {
+                if let Some(label) = caps.get(1) {
+                    labels.push(label.as_str().to_string());
+                }
+            }
         }
         self.outline_items = items;
+        self.labels = labels;
+
+        // Scan bibliography
+        let mut bib_items = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&self.current_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().map_or(false, |ext| ext == "bib") {
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        let re_bib = regex::Regex::new(r"@\w+\{([^,]+),").unwrap();
+                        for cap in re_bib.captures_iter(&content) {
+                            if let Some(key) = cap.get(1) {
+                                bib_items.push(key.as_str().to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.bib_items = bib_items;
     }
 
     fn check_syntax(&self, text: &str) -> Vec<std::ops::Range<usize>> {
@@ -934,6 +1068,44 @@ impl TypesafeApp {
         errors
     }
 
+    fn check_spelling(&self, text: &str) -> Vec<std::ops::Range<usize>> {
+        let mut errors = Vec::new();
+        if self.dictionary.is_empty() {
+             return errors;
+        }
+
+        let mut start_idx = 0;
+        for (i, c) in text.char_indices() {
+             if !c.is_alphabetic() {
+                 if i > start_idx {
+                     let word = &text[start_idx..i];
+                     let lower = word.to_lowercase();
+                     // Filter out LaTeX commands and check dictionary
+                     if !word.starts_with('\\') && !self.dictionary.contains(&lower) {
+                         let is_command = start_idx > 0 && text[..start_idx].ends_with('\\');
+                         if !is_command {
+                            errors.push(start_idx..i);
+                         }
+                     }
+                 }
+                 start_idx = i + 1;
+             }
+        }
+        // Last word
+        if start_idx < text.len() {
+             let word = &text[start_idx..];
+             let lower = word.to_lowercase();
+             if !word.starts_with('\\') && !self.dictionary.contains(&lower) {
+                  let is_command = start_idx > 0 && text[..start_idx].ends_with('\\');
+                  if !is_command {
+                      errors.push(start_idx..text.len());
+                  }
+             }
+        }
+
+        errors
+    }
+
     fn insert_command(&mut self, ctx: &egui::Context, command: &str) {
         if let Some(mut state) = egui::TextEdit::load_state(ctx, egui::Id::new("main_editor")) {
             if let Some(range) = state.cursor.char_range() {
@@ -1044,6 +1216,9 @@ impl TypesafeApp {
         // Run syntax check
         let errors = self.check_syntax(text);
 
+        // Run spell check
+        let spell_errors = self.check_spelling(text);
+
         // Run search check
         let mut search_matches_bytes = Vec::new();
         if self.show_search && !self.search_query.is_empty() {
@@ -1094,6 +1269,15 @@ impl TypesafeApp {
                     }
                 }
 
+                for e in &spell_errors {
+                    if e.start > range_start && e.start < range_end {
+                        split_points.push(e.start - range_start);
+                    }
+                    if e.end > range_start && e.end < range_end {
+                        split_points.push(e.end - range_start);
+                    }
+                }
+
                 for (s, e) in &search_matches_bytes {
                     if *s > range_start && *s < range_end {
                         split_points.push(*s - range_start);
@@ -1115,11 +1299,14 @@ impl TypesafeApp {
                     let sub_text = &range_text[local_start..local_end];
 
                     let has_error = errors.iter().any(|e| e.start <= abs_start && e.end >= abs_end);
+                    let is_spell_error = spell_errors.iter().any(|e| e.start <= abs_start && e.end >= abs_end);
                     let is_search_match =
                         search_matches_bytes.iter().any(|(s, e)| *s <= abs_start && *e >= abs_end);
 
                     let stroke = if has_error {
                         Stroke::new(2.0, theme.error)
+                    } else if is_spell_error {
+                        Stroke::new(1.0, theme.warning)
                     } else {
                         Stroke::NONE
                     };
@@ -1167,16 +1354,25 @@ impl eframe::App for TypesafeApp {
         theme.accent = self.settings.accent.color();
         Self::apply_theme(ctx, theme);
 
+        // Poll synonym results
+        while let Ok((word, synonyms)) = self.synonym_rx.try_recv() {
+            self.synonym_cache.insert(word, synonyms);
+        }
+
         // Poll compilation messages
         while let Ok(msg) = self.compile_rx.try_recv() {
             match msg {
                 CompilationMsg::Start => {
                     self.is_compiling = true;
                     self.compilation_log = "Starting compilation...\n".to_string();
+                    self.diagnostics.clear();
                 }
                 CompilationMsg::Log(line) => {
                     self.compilation_log.push_str(&line);
                     self.compilation_log.push('\n');
+                }
+                CompilationMsg::Diagnostics(diags) => {
+                    self.diagnostics = diags;
                 }
                 CompilationMsg::Success(pdf_path) => {
                     self.is_compiling = false;
@@ -1193,11 +1389,93 @@ impl eframe::App for TypesafeApp {
             }
         }
 
+        if self.show_log {
+            egui::Window::new("Compilation Log & Diagnostics")
+                .open(&mut self.show_log)
+                .resizable(true)
+                .default_height(200.0)
+                .show(ctx, |ui| {
+                    if !self.diagnostics.is_empty() {
+                         ui.label(egui::RichText::new("Diagnostics:").strong().color(egui::Color32::from_rgb(255, 100, 100)));
+                         egui::ScrollArea::vertical().max_height(100.0).id_source("diag_scroll").show(ui, |ui| {
+                             for diag in &self.diagnostics {
+                                 if ui.link(format!("Line {}: {}", diag.line, diag.message)).clicked() {
+                                     // Calculate char index for line
+                                     let char_idx = self.editor_content.lines().take(diag.line.saturating_sub(1)).map(|l| l.len() + 1).sum::<usize>();
+
+                                     if let Some(mut state) = egui::TextEdit::load_state(ctx, egui::Id::new("main_editor")) {
+                                          state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(char_idx))));
+                                          state.store(ctx, egui::Id::new("main_editor"));
+                                     }
+                                 }
+                             }
+                         });
+                         ui.separator();
+                    }
+
+                    ui.label("Raw Log:");
+                    egui::ScrollArea::vertical().id_source("log_scroll").show(ui, |ui| {
+                        ui.add(egui::TextEdit::multiline(&mut self.compilation_log.as_str()).code_editor());
+                    });
+                });
+        }
+
         // Handle keyboard shortcuts
         if ctx.input(|i| {
             i.key_pressed(egui::Key::S) && (i.modifiers.ctrl || i.modifiers.command)
         }) {
             self.save_file();
+        }
+
+        // Block Commenting (Ctrl+/)
+        if ctx.input(|i| i.key_pressed(egui::Key::Slash) && (i.modifiers.ctrl || i.modifiers.command)) {
+            if let Some(state) = egui::TextEdit::load_state(ctx, egui::Id::new("main_editor")) {
+                if let Some(range) = state.cursor.char_range() {
+                    let start = range.primary.index.min(range.secondary.index);
+                    let end = range.primary.index.max(range.secondary.index);
+
+                    let mut current_pos = 0;
+                    let mut start_line_idx = 0;
+                    let mut end_line_idx = 0;
+
+                    let mut lines: Vec<String> = self.editor_content.lines().map(|s| s.to_string()).collect();
+                    // Handle trailing newline case which lines() swallows
+                    if self.editor_content.ends_with('\n') {
+                        lines.push(String::new());
+                    }
+
+                    for (i, line) in lines.iter().enumerate() {
+                        let line_len = line.chars().count() + 1;
+
+                        if current_pos <= start {
+                            start_line_idx = i;
+                        }
+                        if current_pos < end {
+                            end_line_idx = i;
+                        }
+                        current_pos += line_len;
+                    }
+
+                    if start_line_idx < lines.len() {
+                        let target_end = end_line_idx.min(lines.len() - 1);
+                        let target_lines = &lines[start_line_idx..=target_end];
+                        let all_commented = target_lines.iter().all(|l| l.trim_start().starts_with('%'));
+
+                        for i in start_line_idx..=target_end {
+                            if all_commented {
+                                if let Some(idx) = lines[i].find('%') {
+                                    lines[i].remove(idx);
+                                }
+                            } else {
+                                lines[i].insert(0, '%');
+                            }
+                        }
+
+                        self.editor_content = lines.join("\n");
+                        self.is_dirty = true;
+                    }
+                }
+            }
         }
         if ctx.input(|i| {
             i.key_pressed(egui::Key::B) && (i.modifiers.ctrl || i.modifiers.command)
@@ -1228,7 +1506,13 @@ impl eframe::App for TypesafeApp {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 // File Menu
-                ui.menu_button("📁 File", |ui| {
+                ui.menu_button("File", |ui| {
+                    if ui.button("New").clicked() {
+                        self.editor_content = "\\documentclass{article}\n\\begin{document}\n\n\\end{document}".to_string();
+                        self.file_path = "untitled.tex".to_string();
+                        ui.close_menu();
+                    }
+                    ui.separator();
                     if ui.button("Open File...").clicked() {
                         if let Some(path) = rfd::FileDialog::new().add_filter("LaTeX", &["tex"]).pick_file() {
                             self.file_path = path.to_string_lossy().to_string();
@@ -1246,95 +1530,123 @@ impl eframe::App for TypesafeApp {
                             ui.close_menu();
                         }
                     }
-                    if ui.button("Save").clicked() {
+                    ui.separator();
+                    if ui.add(egui::Button::new("Save").shortcut_text("Ctrl+S")).clicked() {
                         self.save_file();
                         ui.close_menu();
                     }
-                });
-
-                // View Menu
-                ui.menu_button("👁 View", |ui| {
-                    if ui.checkbox(&mut self.show_file_panel, "File Explorer").clicked() {
+                    if ui.button("Save As...").clicked() {
+                        self.save_file_as();
                         ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Export PDF...").clicked() {
+                        self.export_pdf();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Settings").clicked() {
+                        self.settings.show_settings_window = true;
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Exit").clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 });
 
-                // Settings menu button
-                if ui.button("⚙ Settings").clicked() {
-                    self.settings.show_appearance_menu = !self.settings.show_appearance_menu;
-                }
-
-                // Commands menu
-                ui.menu_button("📝 Commands", |ui| {
-                    ui.set_min_width(120.0);
-
-                    ui.menu_button("Structure", |ui| {
-                        if ui.button("Part").clicked() { self.insert_command(ctx, "\\part{}"); ui.close_menu(); }
-                        if ui.button("Chapter").clicked() { self.insert_command(ctx, "\\chapter{}"); ui.close_menu(); }
-                        if ui.button("Section").clicked() { self.insert_command(ctx, "\\section{}"); ui.close_menu(); }
-                        if ui.button("Subsection").clicked() { self.insert_command(ctx, "\\subsection{}"); ui.close_menu(); }
-                        if ui.button("Subsubsection").clicked() { self.insert_command(ctx, "\\subsubsection{}"); ui.close_menu(); }
-                        if ui.button("Paragraph").clicked() { self.insert_command(ctx, "\\paragraph{}"); ui.close_menu(); }
-                    });
-
-                    ui.menu_button("Formatting", |ui| {
-                        if ui.button("Bold").clicked() { self.insert_command(ctx, "\\textbf{}"); ui.close_menu(); }
-                        if ui.button("Italic").clicked() { self.insert_command(ctx, "\\textit{}"); ui.close_menu(); }
-                        if ui.button("Underline").clicked() { self.insert_command(ctx, "\\underline{}"); ui.close_menu(); }
-                        if ui.button("Emphasis").clicked() { self.insert_command(ctx, "\\emph{}"); ui.close_menu(); }
-                    });
-
-                    ui.menu_button("Math", |ui| {
-                        if ui.button("Inline Math ($)").clicked() { self.insert_command(ctx, "$$"); ui.close_menu(); }
-                        if ui.button("Display Math (\\[)").clicked() { self.insert_command(ctx, "\\[\n\t\n\\]"); ui.close_menu(); }
-                        if ui.button("Equation").clicked() { self.insert_command(ctx, "\\begin{equation}\n\t\n\\end{equation}"); ui.close_menu(); }
-                        if ui.button("Fraction").clicked() { self.insert_command(ctx, "\\frac{}{}"); ui.close_menu(); }
-                    });
-
-                    ui.menu_button("Environments", |ui| {
-                        if ui.button("Itemize").clicked() { self.insert_command(ctx, "\\begin{itemize}\n\t\\item \n\\end{itemize}"); ui.close_menu(); }
-                        if ui.button("Enumerate").clicked() { self.insert_command(ctx, "\\begin{enumerate}\n\t\\item \n\\end{enumerate}"); ui.close_menu(); }
-                        if ui.button("Figure").clicked() { self.insert_command(ctx, "\\begin{figure}[h]\n\t\\centering\n\t\\caption{}\n\\end{figure}"); ui.close_menu(); }
-                        if ui.button("Table").clicked() { self.insert_command(ctx, "\\begin{table}[h]\n\t\\centering\n\t\\begin{tabular}{c c}\n\t\tA & B \\\\\n\t\\end{tabular}\n\t\\caption{}\n\\end{table}"); ui.close_menu(); }
-                    });
+                // Edit Menu
+                ui.menu_button("Edit", |ui| {
+                     if ui.add(egui::Button::new("Undo").shortcut_text("Ctrl+Z")).clicked() {
+                         // Handled by TextEdit
+                         ui.close_menu();
+                     }
+                     if ui.add(egui::Button::new("Redo").shortcut_text("Ctrl+Y")).clicked() {
+                         // Handled by TextEdit
+                         ui.close_menu();
+                     }
+                     ui.separator();
+                     if ui.add(egui::Button::new("Cut").shortcut_text("Ctrl+X")).clicked() {
+                        // Handled by TextEdit
+                        ui.close_menu();
+                     }
+                     if ui.add(egui::Button::new("Copy").shortcut_text("Ctrl+C")).clicked() {
+                        // Handled by TextEdit
+                        ui.close_menu();
+                     }
+                     if ui.add(egui::Button::new("Paste").shortcut_text("Ctrl+V")).clicked() {
+                        // Handled by TextEdit
+                        ui.close_menu();
+                     }
+                     ui.separator();
+                     if ui.add(egui::Button::new("Find").shortcut_text("Ctrl+F")).clicked() {
+                         self.show_search = !self.show_search;
+                         ui.close_menu();
+                     }
                 });
 
-                // Show appearance menu if open
-                if self.settings.show_appearance_menu {
+                // View Menu
+                ui.menu_button("View", |ui| {
+                    if ui.checkbox(&mut self.show_file_panel, "File Explorer").clicked() {
+                        ui.close_menu();
+                    }
+                    if ui.checkbox(&mut self.show_log, "Compilation Log").clicked() {
+                        ui.close_menu();
+                    }
                     ui.separator();
-                    ui.vertical(|ui| {
-                        ui.set_width(180.0);
-                        ui.label(
-                            egui::RichText::new("🎨 Theme")
-                                .strong()
-                                .color(theme.text_primary),
-                        );
-                        egui::ComboBox::from_id_source("theme_selector")
-                            .selected_text(self.settings.theme.name())
-                            .width(160.0)
-                            .show_ui(ui, |ui| {
-                                for &preset in ThemePreset::all() {
-                                    ui.selectable_value(&mut self.settings.theme, preset, preset.name());
-                                }
-                            });
+                    if ui.add(egui::Button::new("Command Palette").shortcut_text("Ctrl+Shift+P")).clicked() {
+                        self.show_command_palette = !self.show_command_palette;
+                         ui.close_menu();
+                    }
+                });
 
-                        ui.add_space(8.0);
+                // Tools Menu
+                ui.menu_button("Tools", |ui| {
+                     ui.menu_button("LaTeX", |ui| {
+                        ui.menu_button("Structure", |ui| {
+                            if ui.button("Part").clicked() { self.insert_command(ctx, "\\part{}"); ui.close_menu(); }
+                            if ui.button("Chapter").clicked() { self.insert_command(ctx, "\\chapter{}"); ui.close_menu(); }
+                            if ui.button("Section").clicked() { self.insert_command(ctx, "\\section{}"); ui.close_menu(); }
+                            if ui.button("Subsection").clicked() { self.insert_command(ctx, "\\subsection{}"); ui.close_menu(); }
+                            if ui.button("Subsubsection").clicked() { self.insert_command(ctx, "\\subsubsection{}"); ui.close_menu(); }
+                            if ui.button("Paragraph").clicked() { self.insert_command(ctx, "\\paragraph{}"); ui.close_menu(); }
+                        });
 
-                        ui.label(
-                            egui::RichText::new("✨ Accent Color")
-                                .strong()
-                                .color(theme.text_primary),
-                        );
-                        egui::ComboBox::from_id_source("accent_selector")
-                            .selected_text(self.settings.accent.name())
-                            .width(160.0)
-                            .show_ui(ui, |ui| {
-                                for &accent in AccentColor::all() {
-                                    ui.selectable_value(&mut self.settings.accent, accent, accent.name());
-                                }
-                            });
-                    });
-                }
+                        ui.menu_button("Formatting", |ui| {
+                            if ui.button("Bold").clicked() { self.insert_command(ctx, "\\textbf{}"); ui.close_menu(); }
+                            if ui.button("Italic").clicked() { self.insert_command(ctx, "\\textit{}"); ui.close_menu(); }
+                            if ui.button("Underline").clicked() { self.insert_command(ctx, "\\underline{}"); ui.close_menu(); }
+                            if ui.button("Emphasis").clicked() { self.insert_command(ctx, "\\emph{}"); ui.close_menu(); }
+                        });
+
+                        ui.menu_button("Math", |ui| {
+                            if ui.button("Inline Math ($)").clicked() { self.insert_command(ctx, "$$"); ui.close_menu(); }
+                            if ui.button("Display Math (\\[)").clicked() { self.insert_command(ctx, "\\[\n\t\n\\]"); ui.close_menu(); }
+                            if ui.button("Equation").clicked() { self.insert_command(ctx, "\\begin{equation}\n\t\n\\end{equation}"); ui.close_menu(); }
+                            if ui.button("Fraction").clicked() { self.insert_command(ctx, "\\frac{}{}"); ui.close_menu(); }
+                        });
+
+                        ui.menu_button("Environments", |ui| {
+                            if ui.button("Itemize").clicked() { self.insert_command(ctx, "\\begin{itemize}\n\t\\item \n\\end{itemize}"); ui.close_menu(); }
+                            if ui.button("Enumerate").clicked() { self.insert_command(ctx, "\\begin{enumerate}\n\t\\item \n\\end{enumerate}"); ui.close_menu(); }
+                            if ui.button("Figure").clicked() { self.insert_command(ctx, "\\begin{figure}[h]\n\t\\centering\n\t\\caption{}\n\\end{figure}"); ui.close_menu(); }
+                            if ui.button("Table").clicked() { self.insert_command(ctx, "\\begin{table}[h]\n\t\\centering\n\t\\begin{tabular}{c c}\n\t\tA & B \\\\\n\t\\end{tabular}\n\t\\caption{}\n\\end{table}"); ui.close_menu(); }
+                        });
+                     });
+                     ui.separator();
+                     if ui.add(egui::Button::new("Build PDF").shortcut_text("Ctrl+B")).clicked() {
+                         self.compile();
+                         ui.close_menu();
+                     }
+                });
+
+                 // Help Menu
+                ui.menu_button("Help", |ui| {
+                    if ui.button("About").clicked() {
+                        // Placeholder
+                        ui.close_menu();
+                    }
+                });
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.heading(
@@ -1364,6 +1676,69 @@ impl eframe::App for TypesafeApp {
             ui.add_space(4.0);
         });
 
+        if self.settings.show_settings_window {
+            egui::Window::new("Settings")
+                .open(&mut self.settings.show_settings_window)
+                .resizable(true)
+                .default_width(400.0)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.settings.active_tab, SettingsTab::Appearance, "Appearance");
+                        ui.selectable_value(&mut self.settings.active_tab, SettingsTab::Permissions, "Permissions");
+                        ui.selectable_value(&mut self.settings.active_tab, SettingsTab::APIs, "APIs");
+                    });
+                    ui.separator();
+
+                    match self.settings.active_tab {
+                        SettingsTab::Appearance => {
+                            ui.label(
+                                egui::RichText::new("🎨 Theme")
+                                    .strong()
+                                    .color(theme.text_primary),
+                            );
+                            egui::ComboBox::from_id_source("theme_selector")
+                                .selected_text(self.settings.theme.name())
+                                .width(200.0)
+                                .show_ui(ui, |ui| {
+                                    for &preset in ThemePreset::all() {
+                                        ui.selectable_value(&mut self.settings.theme, preset, preset.name());
+                                    }
+                                });
+
+                            ui.add_space(8.0);
+
+                            ui.label(
+                                egui::RichText::new("✨ Accent Color")
+                                    .strong()
+                                    .color(theme.text_primary),
+                            );
+                            egui::ComboBox::from_id_source("accent_selector")
+                                .selected_text(self.settings.accent.name())
+                                .width(200.0)
+                                .show_ui(ui, |ui| {
+                                    for &accent in AccentColor::all() {
+                                        ui.selectable_value(&mut self.settings.accent, accent, accent.name());
+                                    }
+                                });
+                        },
+                        SettingsTab::Permissions => {
+                            ui.label("Permission settings will go here.");
+                        },
+                        SettingsTab::APIs => {
+                            ui.heading("Tectonic Engine");
+                            ui.add_space(4.0);
+                            ui.checkbox(&mut self.settings.auto_compile, "Auto-compile on Save");
+                            ui.add_space(8.0);
+                            if ui.button("🗑 Clear Package Cache").clicked() {
+                                // Placeholder for clearing cache logic
+                                self.compilation_log.push_str("To clear cache manually, delete the tectonic cache directory in your user folder.\n");
+                                self.show_log = true;
+                            }
+                        }
+                    }
+                });
+        }
+
         // ====== LEFT PANEL (FILES) ======
         if self.show_file_panel {
             egui::SidePanel::left("files_panel")
@@ -1384,10 +1759,20 @@ impl eframe::App for TypesafeApp {
                     ui.push_id("files_section", |ui| {
                         egui::ScrollArea::vertical().max_height(height * 0.5).show(ui, |ui| {
                             ui.horizontal(|ui| {
+                                if ui.button("🏠").on_hover_text("Home").clicked() {
+                                    let home = std::env::var("USERPROFILE")
+                                        .or_else(|_| std::env::var("HOME"))
+                                        .map(std::path::PathBuf::from)
+                                        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                                    self.current_dir = home;
+                                }
                                 if ui.button("⬆").on_hover_text("Up Directory").clicked() {
                                     if let Some(parent) = self.current_dir.parent() {
                                         self.current_dir = parent.to_path_buf();
                                     }
+                                }
+                                if ui.button("🔄").on_hover_text("Refresh").clicked() {
+                                    ctx.request_repaint();
                                 }
                                 ui.label(
                                     egui::RichText::new(self.current_dir.file_name().unwrap_or_default().to_string_lossy())
@@ -1900,8 +2285,24 @@ impl eframe::App for TypesafeApp {
                         self.completion_selected_index += 1;
                     }
                 }
+                if ctx.input(|i| i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Tab)) {
+                    ctx.input_mut(|i| {
+                        i.consume_key(egui::Modifiers::NONE, egui::Key::Enter);
+                        i.consume_key(egui::Modifiers::NONE, egui::Key::Tab);
+                    });
+                    if let Some((completion, _)) = self.completion_suggestions.get(self.completion_selected_index) {
+                        let completion = completion.clone();
+                        self.apply_completion(ctx, &mut text, &completion);
+                        self.show_completions = false;
+                        self.editor_content = text.clone();
+                    }
+                }
+                if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    self.show_completions = false;
+                }
             }
 
+            let gutter_width = 30.0;
             egui::ScrollArea::vertical()
                 .id_source("editor_scroll")
                 .show(ui, |ui| {
@@ -1911,15 +2312,246 @@ impl eframe::App for TypesafeApp {
                         ui.fonts(|f| f.layout_job(layout_job))
                     };
 
-                    let response = ui.add(
-                        egui::TextEdit::multiline(&mut text)
-                            .id(editor_id)
-                            .font(TextStyle::Monospace)
-                            .desired_width(f32::INFINITY)
-                            .code_editor()
-                            .lock_focus(true)
-                            .layouter(&mut layouter),
-                    );
+                    let output = egui::Frame::none()
+                        .inner_margin(egui::Margin { left: gutter_width, ..Default::default() })
+                        .show(ui, |ui| {
+                            egui::TextEdit::multiline(&mut text)
+                                .id(editor_id)
+                                .font(TextStyle::Monospace)
+                                .desired_width(f32::INFINITY)
+                                .code_editor()
+                                .lock_focus(true)
+                                .layouter(&mut layouter)
+                                .show(ui)
+                        });
+
+                    let response = output.inner.response;
+
+                    // Context Menu Logic
+                    if response.secondary_clicked() {
+                        if let Some(pos) = response.interact_pointer_pos() {
+                            let galley = output.inner.galley.clone();
+                            {
+                                let rel_pos = pos - response.rect.min;
+                                let cursor = galley.cursor_from_pos(rel_pos);
+                                let idx = cursor.ccursor.index;
+
+                                let text_chars: Vec<char> = self.editor_content.chars().collect();
+                                if idx < text_chars.len() {
+                                    // Find word boundaries
+                                    let mut start = idx;
+                                    while start > 0 && text_chars[start - 1].is_alphanumeric() {
+                                        start -= 1;
+                                    }
+                                    let mut end = idx;
+                                    while end < text_chars.len() && text_chars[end].is_alphanumeric() {
+                                        end += 1;
+                                    }
+
+                                    if start < end {
+                                        let word: String = text_chars[start..end].iter().collect();
+                                        // Convert char indices to byte indices for range replacement
+                                        let start_byte = self.editor_content.chars().take(start).map(|c| c.len_utf8()).sum();
+                                        let end_byte = self.editor_content.chars().take(end).map(|c| c.len_utf8()).sum();
+
+                                        self.context_menu_word = Some(word.clone());
+                                        self.context_menu_replace_range = Some(start_byte..end_byte);
+
+                                        // Populate spelling suggestions
+                                        let lower = word.to_lowercase();
+                                        let mut suggestions = Vec::new();
+                                        if !self.dictionary.is_empty() && !self.dictionary.contains(&lower) {
+                                            let target_len = lower.len();
+                                            for valid_word in &self.dictionary {
+                                                if valid_word.len().abs_diff(target_len) <= 2 {
+                                                    let dist = strsim::levenshtein(&lower, valid_word);
+                                                    if dist <= 2 {
+                                                        suggestions.push((dist, valid_word.clone()));
+                                                    }
+                                                }
+                                            }
+                                            suggestions.sort_by_key(|k| k.0);
+                                            suggestions.truncate(3);
+                                        }
+                                        self.context_menu_suggestions = suggestions.into_iter().map(|x| x.1).collect();
+
+                                    } else {
+                                        self.context_menu_word = None;
+                                        self.context_menu_replace_range = None;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Trigger synonym fetch if needed
+                    if let Some(word) = &self.context_menu_word {
+                        let lower = word.to_lowercase();
+                        if !self.synonym_cache.contains_key(&lower) && !self.pending_synonyms.contains(&lower) {
+                             self.pending_synonyms.insert(lower.clone());
+                             let tx = self.synonym_tx.clone();
+                             let w = lower.clone();
+                             std::thread::spawn(move || {
+                                  let url = format!("https://api.datamuse.com/words?rel_syn={}", w);
+                                  if let Ok(resp) = reqwest::blocking::get(&url) {
+                                      if let Ok(json) = resp.json::<Vec<serde_json::Value>>() {
+                                           let syns: Vec<String> = json.iter()
+                                               .filter_map(|v| v["word"].as_str().map(|s| s.to_string()))
+                                               .take(5)
+                                               .collect();
+                                           let _ = tx.send((w, syns));
+                                      }
+                                  }
+                             });
+                        }
+                    }
+
+                    let selected_word = self.context_menu_word.clone();
+                    let selected_range = self.context_menu_replace_range.clone();
+                    let selected_suggestions = self.context_menu_suggestions.clone();
+                    let mut replacement = None;
+
+                    response.context_menu(|ui| {
+                        if let Some(word) = &selected_word {
+                            ui.label(egui::RichText::new(format!("Selected: \"{}\"", word)).strong());
+                            ui.separator();
+
+                            if selected_suggestions.is_empty() {
+                                ui.label(egui::RichText::new("No spelling suggestions").italics());
+                            } else {
+                                for suggestion in &selected_suggestions {
+                                    if ui.button(format!("Fix: {}", suggestion)).clicked() {
+                                        replacement = Some(suggestion.clone());
+                                        ui.close_menu();
+                                    }
+                                }
+                            }
+
+                            ui.separator();
+                            let lower = word.to_lowercase();
+                            ui.menu_button("Synonyms", |ui| {
+                                 if let Some(synonyms) = self.synonym_cache.get(&lower) {
+                                     if synonyms.is_empty() {
+                                         ui.label("No synonyms found.");
+                                     } else {
+                                         for syn in synonyms {
+                                             if ui.button(syn).clicked() {
+                                                 replacement = Some(syn.to_string());
+                                                 ui.close_menu();
+                                             }
+                                         }
+                                     }
+                                 } else {
+                                     ui.spinner();
+                                     ui.label("Fetching...");
+                                 }
+                            });
+                        } else {
+                             ui.label("No word selected");
+                        }
+                    });
+
+                    if let Some(text) = replacement {
+                        if let Some(range) = selected_range {
+                             if range.start < self.editor_content.len() && range.end <= self.editor_content.len() {
+                                 self.editor_content.replace_range(range, &text);
+                                 self.is_dirty = true;
+                             }
+                        }
+                    }
+
+                    // Paint line numbers
+                    {
+                        let galley = output.inner.galley.clone();
+                        let painter = ui.painter();
+                        let min_pos = response.rect.min - egui::vec2(gutter_width, 0.0);
+
+                        // Paint gutter background
+                        let gutter_rect = egui::Rect::from_min_max(
+                            min_pos,
+                            egui::pos2(min_pos.x + gutter_width, response.rect.max.y)
+                        );
+                        painter.rect_filled(gutter_rect, 0.0, theme_clone.bg_tertiary);
+
+                        let mut logical_line = 1;
+                        let mut start_new_line = true;
+
+                        for row in &galley.rows {
+                             if start_new_line {
+                                 let pos = min_pos + egui::vec2(0.0, row.rect.min.y - galley.rect.min.y);
+                                 painter.text(
+                                     pos + egui::vec2(gutter_width - 4.0, 0.0),
+                                     egui::Align2::RIGHT_TOP,
+                                     logical_line.to_string(),
+                                     egui::FontId::monospace(10.0),
+                                     theme_clone.text_secondary,
+                                 );
+                                 logical_line += 1;
+                             }
+                             start_new_line = row.ends_with_newline;
+                        }
+                    }
+
+                    if response.changed() {
+                        self.editor_content = text.clone();
+                        self.is_dirty = true;
+
+                        // Autocomplete Trigger
+                        if let Some(state) = egui::TextEdit::load_state(ctx, editor_id) {
+                            if let Some(range) = state.cursor.char_range() {
+                                let idx = range.primary.index;
+                                let text_slice = &self.editor_content[..idx];
+
+                                self.show_completions = false;
+                                self.completion_suggestions.clear();
+
+                                if text_slice.ends_with("\\ref{") {
+                                    self.show_completions = true;
+                                    self.completion_suggestions = self.labels.iter().map(|l| (l.clone(), "Label".to_string())).collect();
+                                } else if text_slice.ends_with("\\cite{") {
+                                    self.show_completions = true;
+                                    self.completion_suggestions = self.bib_items.iter().map(|b| (b.clone(), "Bib".to_string())).collect();
+                                }
+
+                                if self.show_completions {
+                                    // Calculate popup position
+                                    if let Some(range) = state.cursor.char_range() {
+                                        let galley = output.inner.galley.clone();
+                                        let cursor = galley.from_ccursor(range.primary);
+                                        let cursor_rect = galley.pos_from_cursor(&cursor);
+                                        self.completion_popup_pos = response.rect.min + cursor_rect.max.to_vec2() + egui::vec2(0.0, 5.0);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if self.show_completions && !self.completion_suggestions.is_empty() {
+                         let pos = self.completion_popup_pos;
+                         egui::Area::new(egui::Id::new("completion_popup"))
+                             .fixed_pos(pos)
+                             .order(egui::Order::Foreground)
+                             .show(ctx, |ui| {
+                                 egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                     ui.set_max_width(300.0);
+                                     ui.set_max_height(200.0);
+                                     egui::ScrollArea::vertical().show(ui, |ui| {
+                                         let suggestions = self.completion_suggestions.clone();
+                                         for (i, (suggestion, kind)) in suggestions.iter().enumerate() {
+                                             let selected = i == self.completion_selected_index;
+                                             let label = format!("{} ({})", suggestion, kind);
+                                             if ui.selectable_label(selected, label).clicked() {
+                                                 self.completion_selected_index = i;
+                                                 let completion = suggestion.clone();
+                                                 self.apply_completion(ctx, &mut text, &completion);
+                                                 self.show_completions = false;
+                                                 self.editor_content = text.clone();
+                                             }
+                                         }
+                                     });
+                                 });
+                             });
+                    }
 
                     // Smart Indentation
                     if response.has_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.is_none()) {
@@ -2371,9 +3003,7 @@ impl eframe::App for TypesafeApp {
     }
 }
 
-// ============================================================================
-// HELPER FUNCTIONS
-// ============================================================================
+// Helper Functions
 
 fn ensure_fontconfig() {
     let fonts_conf_path = if std::path::Path::new("fonts.conf").exists() {
@@ -2459,13 +3089,42 @@ fn render_pdf_page_to_texture(
     ))
 }
 
+fn load_icon() -> Option<egui::IconData> {
+    let icon_path = if std::path::Path::new("icon.png").exists() {
+        "icon.png"
+    } else if std::path::Path::new("deps/icon.png").exists() {
+        "deps/icon.png"
+    } else {
+        return None;
+    };
+
+    if let Ok(image) = image::open(icon_path) {
+        let image = image.to_rgba8();
+        let (width, height) = image.dimensions();
+        let rgba = image.into_raw();
+        Some(egui::IconData {
+            rgba,
+            width,
+            height,
+        })
+    } else {
+        None
+    }
+}
+
 fn main() -> Result<(), eframe::Error> {
     ensure_fontconfig();
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_min_inner_size([1200.0, 700.0])
+        .with_maximized(true);
+
+    if let Some(icon) = load_icon() {
+        viewport = viewport.with_icon(icon);
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_min_inner_size([1200.0, 700.0])
-            .with_maximized(true),
+        viewport,
         ..Default::default()
     };
 

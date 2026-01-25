@@ -8,7 +8,7 @@ fn main() {
     let out_dir = env::var("OUT_DIR").unwrap();
     let out_path = PathBuf::from(&out_dir);
 
-    // Get the target directory (where the executable will be built)
+    // Get the target directory
     let target_dir = out_path
         .ancestors()
         .find(|p| p.file_name().map_or(false, |n| n == "target"))
@@ -21,7 +21,7 @@ fn main() {
         PathBuf::from("deps")
     };
 
-    // Create deps directory if it doesn't exist
+    // Create deps directory
     let _ = fs::create_dir_all(&deps_dir);
 
     let pdfium_path = deps_dir.join("pdfium.dll");
@@ -46,8 +46,6 @@ fn main() {
 
     // Tell cargo to link the library
     println!("cargo:rustc-link-search=native={}", deps_dir.display());
-
-    // Windows subsystem will be handled by eframe/egui automatically
 }
 
 fn download_pdfium(deps_dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
@@ -87,7 +85,7 @@ fn download_pdfium(deps_dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>>
             fs::copy(&bin_dll, &deps_dll)?;
         }
 
-        // Clean up extracted files and the TGZ file
+        // Clean up
         let _ = fs::remove_dir_all(deps_dir.join("bin"));
         let _ = fs::remove_dir_all(deps_dir.join("include"));
         let _ = fs::remove_dir_all(deps_dir.join("lib"));
@@ -109,7 +107,7 @@ fn download_pdfium(deps_dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>>
 
 fn download_tectonic(deps_dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let zip_path = deps_dir.join("tectonic.zip");
-    // Using a fixed version to ensure stability (0.15.0)
+    // Using a fixed version (0.15.0)
     let url = "https://github.com/tectonic-typesetting/tectonic/releases/download/tectonic@0.15.0/tectonic-0.15.0-x86_64-pc-windows-msvc.zip";
 
     #[cfg(target_os = "windows")]
