@@ -22,7 +22,7 @@ const Hero: React.FC = () => {
 
       <div className="flex flex-col sm:flex-row gap-4 w-full sm:w-auto">
         <a
-          href="/typesafe-alpha.zip"
+          href="https://github.com/lylebromfield/typesafe/releases/latest/download/typesafe-alpha.zip"
           className="group relative inline-flex items-center justify-center px-8 py-4 bg-gruvbox-orangeBright text-gruvbox-bgHard font-bold rounded-lg text-lg overflow-hidden transition-transform active:scale-95 hover:bg-gruvbox-orange shadow-lg hover:shadow-gruvbox-orange/20"
         >
           <span className="absolute w-0 h-0 transition-all duration-500 ease-out bg-white rounded-full group-hover:w-56 group-hover:h-56 opacity-10"></span>

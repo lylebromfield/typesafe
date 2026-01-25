@@ -28,7 +28,6 @@ build_package.bat
 *.fdb_latexmk
 *.pdf
 *.zip
-!web/public/*.zip
 
 
 # IDE and System Files

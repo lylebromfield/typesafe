@@ -67,13 +67,12 @@ if exist "web\logo.svg" copy /y "web\logo.svg" "release_dist\web\" >nul
 if exist "icon.png" copy /y "icon.png" "release_dist\" >nul
 
 echo Zipping release...
-if not exist "web\public" mkdir "web\public"
-powershell Compress-Archive -Path "release_dist\*" -DestinationPath "web\public\typesafe-alpha.zip" -Force
+powershell Compress-Archive -Path "release_dist\*" -DestinationPath "typesafe-alpha.zip" -Force
 
 echo Cleaning up temporary files...
 if exist "release_dist" rmdir /s /q "release_dist"
 
 echo [SUCCESS] Build complete.
 echo - Binary: target\release\typesafe.exe (Standalone)
-echo - Archive: web\public\typesafe-alpha.zip
+echo - Archive: typesafe-alpha.zip
 endlocal
