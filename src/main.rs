@@ -530,11 +530,13 @@ impl Default for TypesafeApp {
 
         // Try to find a default tex file
         let mut default_file = "test.tex".to_string();
+        let mut found_file = false;
         if let Ok(entries) = std::fs::read_dir(&current_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.extension().map_or(false, |ext| ext == "tex") {
                     default_file = path.to_string_lossy().to_string();
+                    found_file = true;
                     break;
                 }
             }
@@ -625,7 +627,7 @@ impl Default for TypesafeApp {
             is_compiling: false,
             compile_rx: rx,
             compile_tx: tx,
-            pending_autocompile: true,
+            pending_autocompile: found_file,
             diagnostics: Vec::new(),
             page_sizes: std::collections::HashMap::new(),
             pending_scroll_target: None,
@@ -2539,10 +2541,14 @@ impl eframe::App for TypesafeApp {
             }
 
             let gutter_width = 30.0;
+            let scroll_target = self.pending_cursor_scroll;
+            if self.pending_cursor_scroll.is_some() {
+                self.pending_cursor_scroll = None;
+            }
+
             egui::ScrollArea::vertical()
                 .id_source("editor_scroll")
                 .show(ui, |ui| {
-                    let scroll_target = self.pending_cursor_scroll;
                     let mut layouter = |ui: &egui::Ui, string: &str, wrap_width: f32| {
                         let mut layout_job = self.syntax_highlighting(&theme_clone, string);
                         layout_job.wrap.max_width = wrap_width;
