@@ -1,6 +1,7 @@
 # Rust Build Artifacts
 /target/
 /dist/
+/release_dist/
 
 # Downloaded Dependencies (Binaries)
 # We track the deps/ folder structure, but not the large binaries it downloads
@@ -14,6 +15,8 @@ deps/*.lib
 /*.exe
 /*.dll
 /*.pdb
+/*.bat
+build_package.bat
 
 # LaTeX Build Artifacts
 *.aux
@@ -24,6 +27,9 @@ deps/*.lib
 *.fls
 *.fdb_latexmk
 *.pdf
+*.zip
+!web/public/*.zip
+
 
 # IDE and System Files
 .vscode/

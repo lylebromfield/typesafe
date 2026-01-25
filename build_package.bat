@@ -15,78 +15,65 @@ if %errorlevel% neq 0 (
     exit /b %errorlevel%
 )
 
-REM ------------------------------------------------------------------
-REM Deploy to Root
-REM ------------------------------------------------------------------
-echo [INFO] Deploying artifacts to project root...
-
 if not exist "target\release\typesafe.exe" (
     echo [ERROR] Build artifact not found in target\release\typesafe.exe
     exit /b 1
 )
 
-copy /y "target\release\typesafe.exe" ".\typesafe.exe" >nul
-
-REM Copy PDFium if present (needed for runtime)
-if exist "deps\pdfium.dll" (
-    echo [INFO] Copying pdfium.dll to root...
-    copy /y "deps\pdfium.dll" ".\pdfium.dll"
-)
-
-REM Copy executable to root
-echo [INFO] Copying typesafe.exe to root...
-copy /y "target\release\typesafe.exe" ".\typesafe.exe"
-
-REM Generate icon from SVG if present
+REM ------------------------------------------------------------------
+REM Generate Assets
+REM ------------------------------------------------------------------
+REM Generate icon from SVG if present (Runs executable in headless mode)
 echo [INFO] Generating icon.png...
-".\typesafe.exe" --gen-icon
+"target\release\typesafe.exe" --gen-icon
 
-REM Copy Tectonic and Pdfium to target/release for standalone running
-echo [INFO] Populating target/release...
+REM ------------------------------------------------------------------
+REM Populate target/release (Standalone Run Support)
+REM ------------------------------------------------------------------
+echo [INFO] Populating target/release for standalone running...
+
 if exist "deps\tectonic.exe" (
     echo Copying tectonic.exe to target/release...
-    copy /y "deps\tectonic.exe" "target\release\"
+    copy /y "deps\tectonic.exe" "target\release\" >nul
 )
 if exist "deps\pdfium.dll" (
     echo Copying pdfium.dll to target/release...
-    copy /y "deps\pdfium.dll" "target\release\"
+    copy /y "deps\pdfium.dll" "target\release\" >nul
 )
 if exist "icon.png" (
     echo Copying icon.png to target/release...
-    copy /y "icon.png" "target\release\"
+    copy /y "icon.png" "target\release\" >nul
 )
 if exist "dictionary.txt" (
     echo Copying dictionary.txt to target/release...
-    copy /y "dictionary.txt" "target\release\"
+    copy /y "dictionary.txt" "target\release\" >nul
 )
 
-REM Copy dependencies to root for running from root
-echo [INFO] Populating root...
-if exist "deps\tectonic.exe" (
-    echo Copying tectonic.exe to root...
-    copy /y "deps\tectonic.exe" ".\tectonic.exe"
-)
-if exist "deps\pdfium.dll" (
-    echo Copying pdfium.dll to root...
-    copy /y "deps\pdfium.dll" ".\pdfium.dll"
-)
-
-REM Create distribution archive
+REM ------------------------------------------------------------------
+REM Create Distribution Archive (for Web)
+REM ------------------------------------------------------------------
 echo [INFO] Creating distribution archive...
+
 if exist "release_dist" rmdir /s /q "release_dist"
 mkdir "release_dist"
 mkdir "release_dist\web"
 
 echo Copying release files...
-copy /y "target\release\typesafe.exe" "release_dist\"
-if exist "deps\tectonic.exe" copy /y "deps\tectonic.exe" "release_dist\"
-if exist "deps\pdfium.dll" copy /y "deps\pdfium.dll" "release_dist\"
-if exist "dictionary.txt" copy /y "dictionary.txt" "release_dist\"
-if exist "web\logo.svg" copy /y "web\logo.svg" "release_dist\web\"
-if exist "icon.png" copy /y "icon.png" "release_dist\"
+copy /y "target\release\typesafe.exe" "release_dist\" >nul
+if exist "deps\tectonic.exe" copy /y "deps\tectonic.exe" "release_dist\" >nul
+if exist "deps\pdfium.dll" copy /y "deps\pdfium.dll" "release_dist\" >nul
+if exist "dictionary.txt" copy /y "dictionary.txt" "release_dist\" >nul
+if exist "web\logo.svg" copy /y "web\logo.svg" "release_dist\web\" >nul
+if exist "icon.png" copy /y "icon.png" "release_dist\" >nul
 
 echo Zipping release...
-powershell Compress-Archive -Path "release_dist\*" -DestinationPath "typesafe_v0.2.0.zip" -Force
+if not exist "web\public" mkdir "web\public"
+powershell Compress-Archive -Path "release_dist\*" -DestinationPath "web\public\typesafe-alpha.zip" -Force
 
-echo [SUCCESS] Build complete. Archive created at typesafe_v0.2.0.zip
+echo Cleaning up temporary files...
+if exist "release_dist" rmdir /s /q "release_dist"
+
+echo [SUCCESS] Build complete.
+echo - Binary: target\release\typesafe.exe (Standalone)
+echo - Archive: web\public\typesafe-alpha.zip
 endlocal

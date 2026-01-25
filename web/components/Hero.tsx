@@ -1,5 +1,5 @@
-import React from 'react';
-import { GithubIcon, DownloadIcon, LogoIcon } from './Icons';
+import React from "react";
+import { GithubIcon, DownloadIcon, LogoIcon } from "./Icons";
 
 const Hero: React.FC = () => {
   return (
@@ -15,12 +15,14 @@ const Hero: React.FC = () => {
       </h1>
 
       <p className="text-xl md:text-2xl text-gruvbox-gray max-w-2xl mb-12 font-light leading-relaxed">
-        A modern, blazing fast <span className="text-gruvbox-orangeBright font-semibold">Rust</span> based LaTeX editor designed for reliability and speed.
+        A modern, blazing fast{" "}
+        <span className="text-gruvbox-orangeBright font-semibold">Rust</span>{" "}
+        based LaTeX editor designed for reliability and speed.
       </p>
 
       <div className="flex flex-col sm:flex-row gap-4 w-full sm:w-auto">
         <a
-          href="#download-placeholder"
+          href="/typesafe-alpha.zip"
           className="group relative inline-flex items-center justify-center px-8 py-4 bg-gruvbox-orangeBright text-gruvbox-bgHard font-bold rounded-lg text-lg overflow-hidden transition-transform active:scale-95 hover:bg-gruvbox-orange shadow-lg hover:shadow-gruvbox-orange/20"
         >
           <span className="absolute w-0 h-0 transition-all duration-500 ease-out bg-white rounded-full group-hover:w-56 group-hover:h-56 opacity-10"></span>

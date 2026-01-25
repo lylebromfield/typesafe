@@ -1,76 +1,26 @@
-<!DOCTYPE html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Typesafe - Rust LaTeX Editor</title>
-    <meta name="description" content="A blazing fast, type-safe LaTeX editor written in Rust." />
-    <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Anonymous+Pro:wght@400;700&family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
-    <script>
-      tailwind.config = {
-        theme: {
-          extend: {
-            colors: {
-              gruvbox: {
-                bg: '#282828',       // Dark background
-                bgHard: '#1d2021',   // Darker background (contrast)
-                bgSoft: '#32302f',   // Lighter background
-                fg: '#ebdbb2',       // Main text (off-white)
-                fg0: '#fbf1c7',      // Bright text
-                gray: '#928374',     // Gray
-                red: '#cc241d',
-                green: '#98971a',
-                yellow: '#d79921',
-                blue: '#458588',
-                purple: '#b16286',
-                aqua: '#689d6a',
-                orange: '#d65d0e',   // Rusty orange (darker)
-                orangeBright: '#fe8019', // Rusty orange (brighter)
-              }
-            },
-            fontFamily: {
-              sans: ['Inter', 'sans-serif'],
-              mono: ['"JetBrains Mono"', 'monospace'],
-              digital: ['"Anonymous Pro"', 'monospace'],
-            }
-          }
-        }
-      }
-    </script>
-    <style>
-      body {
-        background-color: #282828;
-        color: #ebdbb2;
-      }
-      /* Custom scrollbar for Webkit */
-      ::-webkit-scrollbar {
-        width: 10px;
-      }
-      ::-webkit-scrollbar-track {
-        background: #1d2021;
-      }
-      ::-webkit-scrollbar-thumb {
-        background: #928374;
-        border-radius: 5px;
-      }
-      ::-webkit-scrollbar-thumb:hover {
-        background: #fe8019;
-      }
-    </style>
-  <script type="importmap">
 {
-  "imports": {
-    "react/": "https://esm.sh/react@^19.2.3/",
-    "react": "https://esm.sh/react@^19.2.3",
-    "react-dom/": "https://esm.sh/react-dom@^19.2.3/"
+  "name": "typesafe-web",
+  "private": true,
+  "version": "0.2.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.7",
+    "@types/react": "^18.2.66",
+    "@types/react-dom": "^18.2.22",
+    "@vitejs/plugin-react": "^4.2.1",
+    "autoprefixer": "^10.4.19",
+    "postcss": "^8.4.38",
+    "tailwindcss": "^3.4.3",
+    "typescript": "^5.2.2",
+    "vite": "^5.2.0"
   }
 }
-</script>
-<link rel="stylesheet" href="/index.css">
-</head>
-  <body>
-    <div id="root"></div>
-  <script type="module" src="/index.tsx"></script>
-</body>
-</html>

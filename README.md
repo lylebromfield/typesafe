@@ -1,59 +1,64 @@
-# Typesafe
+# TypeSafe
 
-Typesafe is a modern, offline-first LaTeX editor built with Rust and egui. It features a real-time PDF preview, intelligent autocomplete, and a distraction-free writing environment.
+TypeSafe is a modern, blazing fast LaTeX editor built with **Rust** and **egui**. It is designed for reliability, speed, and a crash-free experience.
+
+![TypeSafe Logo](web/logo.svg)
 
 ## Features
 
-- **Real-time Preview**: Instant feedback as you type (powered by `pdfium`).
-- **Offline-First**: Uses the `tectonic` typesetting engine which manages packages automatically, but the editor itself works fully offline once packages are cached.
-- **Intelligent Autocomplete**:
-  - `\ref{}` triggers a popup of all `\label{}` definitions in your project.
-  - `\cite{}` triggers a popup of bibliography entries from `.bib` files.
-- **Spell Check & Thesaurus**:
-  - **Spell Check**: Uses a local dictionary (`dictionary.txt`) to highlight typos. (Downloaded automatically on first run, ~4MB).
-  - **Thesaurus**: Right-click context menu provides synonyms via the Datamuse API (requires internet connection).
-- **Diagnostics**: Clickable error logs that jump directly to the problematic line.
+- **Blazing Fast Compilation**: Powered by the [Tectonic](https://tectonic-typesetting.github.io/) engine.
+- **Live Preview**: Embedded PDF viewer using `pdfium-render` with fast refresh.
+- **SyncTeX Support**:
+  - **Forward Search**: Ctrl+J (or Right Click -> Go to PDF) to jump to the PDF location.
+  - **Inverse Search**: Double-click the PDF to jump to the source code.
+- **Offline Spell-Checking**: Built-in dictionary with suggestions.
+- **Thesaurus**: Online synonym lookup via Datamuse API.
+- **Auto-Complete**: Intelligent suggestions for LaTeX commands and environments.
+- **Memory Safe**: Written in Rust to prevent common crashes and segmentation faults.
 
-## Building from Source
+## Website
 
-To build Typesafe, you need to have **Rust** and **Cargo** installed.
+The official website is hosted on Cloudflare Pages and includes the latest download link.
+Source code for the website is located in `web/`.
 
-1.  **Install Rust**: Visit [rustup.rs](https://rustup.rs/) to install.
-2.  **Clone the Repository**:
-    ```bash
-    git clone https://github.com/yourusername/typesafe.git
-    cd typesafe
-    ```
-3.  **Build**:
-    You can use the included batch script (Windows) or standard cargo commands.
+## Installation
 
-    **Option A: Windows Batch Script**
-    ```cmd
-    build_package.bat
-    ```
-    This script performs an **incremental build** (preserving build artifacts in `target/` for faster re-compilation), copies `tectonic.exe` and `pdfium.dll` from the `deps/` folder (if present), and places the final `typesafe.exe` in the root directory.
+### Download
 
-    **Option B: Manual Build**
+You can download the latest alpha release (`typesafe-alpha.zip`) from our website or build it yourself.
+
+### Build from Source
+
+**Prerequisites:**
+- Rust (Cargo) installed.
+- Windows (currently targeted platform, though Linux/macOS support is possible).
+
+**Steps:**
+
+1.  Clone the repository.
+2.  Build the release binary:
     ```bash
     cargo build --release
     ```
-    The executable will be located in `target/release/typesafe`.
+    This will compile the application. The executable will be located in `target/release/typesafe.exe`.
 
-### Runtime Dependencies
+    *Note: The build process automatically downloads necessary dependencies (`tectonic` and `pdfium`) into the `deps/` directory.*
 
-Typesafe requires two external binaries to function correctly. These should be placed in the same directory as the executable or in a `deps/` subdirectory:
+3.  **Run**:
+    You can run the application directly via Cargo:
+    ```bash
+    cargo run --release
+    ```
 
-1.  **Tectonic**: The LaTeX engine.
-    - Windows: `tectonic.exe`
-    - Linux/macOS: `tectonic` (or installed via package manager)
-2.  **PDFium**: The PDF rendering library.
-    - Windows: `pdfium.dll`
-    - Linux: `libpdfium.so`
-    - macOS: `libpdfium.dylib`
+    Or run the executable from `target/release/`. Ensure that `tectonic.exe` and `pdfium.dll` are accessible (either in the same directory, in a `deps/` subdirectory, or on your system PATH).
 
-*Note: The `build_package.bat` script handles copying these files automatically if they are present in the `deps/` folder.*
+## Project Structure
 
-## Customization
+- `src/`: Rust source code.
+- `web/`: React + Vite website source.
+- `deps/`: External binaries (Tectonic, PDFium) downloaded during build.
+- `build.rs`: Cargo build script for downloading dependencies.
 
-- **App Icon**: Place a 256x256 PNG file named `icon.png` in the project root to set the window icon.
-- **Dictionary**: The app downloads `dictionary.txt` from GitHub on the first launch. You can manually replace this file with any newline-separated word list to change the spell check dictionary.
+## License
+
+MIT License.
