@@ -7,6 +7,12 @@ cd /d "%~dp0"
 echo [INFO] Starting build...
 
 REM ------------------------------------------------------------------
+REM Generate Assets (Before build to embed resources)
+REM ------------------------------------------------------------------
+echo [INFO] Generating icon resources...
+cargo run -- --gen-icon
+
+REM ------------------------------------------------------------------
 REM Build Release
 REM ------------------------------------------------------------------
 cargo build --release
@@ -19,13 +25,6 @@ if not exist "target\release\typesafe.exe" (
     echo [ERROR] Build artifact not found in target\release\typesafe.exe
     exit /b 1
 )
-
-REM ------------------------------------------------------------------
-REM Generate Assets
-REM ------------------------------------------------------------------
-REM Generate icon from SVG if present (Runs executable in headless mode)
-echo [INFO] Generating icon.png...
-"target\release\typesafe.exe" --gen-icon
 
 REM ------------------------------------------------------------------
 REM Populate target/release (Standalone Run Support)

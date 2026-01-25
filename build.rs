@@ -1,10 +1,23 @@
+#[cfg(windows)]
+extern crate winres;
+
 use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
+    #[cfg(windows)]
+    {
+        let mut res = winres::WindowsResource::new();
+        if std::path::Path::new("icon.ico").exists() {
+            res.set_icon("icon.ico");
+        }
+        res.compile().unwrap();
+    }
+
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=icon.ico");
     let out_dir = env::var("OUT_DIR").unwrap();
     let out_path = PathBuf::from(&out_dir);
 

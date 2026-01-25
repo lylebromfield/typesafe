@@ -1,8 +1,9 @@
-import React from 'react';
-import Navbar from './components/Navbar';
-import Hero from './components/Hero';
-import FeatureGrid from './components/FeatureGrid';
-import Footer from './components/Footer';
+import React from "react";
+import Navbar from "./components/Navbar";
+import Hero from "./components/Hero";
+import Screenshot from "./components/Screenshot";
+import FeatureGrid from "./components/FeatureGrid";
+import Footer from "./components/Footer";
 
 const App: React.FC = () => {
   return (
@@ -10,6 +11,7 @@ const App: React.FC = () => {
       <Navbar />
       <main>
         <Hero />
+        <Screenshot />
         <FeatureGrid />
       </main>
       <Footer />

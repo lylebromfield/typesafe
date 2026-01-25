@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
+use serde::{Deserialize, Serialize};
 use image;
 use egui::{
     Align, Color32, FontId, Frame, Layout, Rounding, Stroke, TextStyle, Vec2, Visuals,
@@ -26,7 +27,7 @@ use std::os::windows::process::CommandExt;
 
 // Themes
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ThemePreset {
     // Modern
     Serendipity,
@@ -309,7 +310,7 @@ impl ThemeColors {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AccentColor {
     Blue,
     Purple,
@@ -384,20 +385,24 @@ enum CompilationMsg {
 
 // Settings and App State
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Default)]
 enum SettingsTab {
+    #[default]
     Appearance,
     Permissions,
     APIs,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Settings {
     pub theme: ThemePreset,
     pub accent: AccentColor,
+    #[serde(skip)]
     pub show_settings_window: bool,
+    #[serde(skip)]
     pub active_tab: SettingsTab,
     pub auto_compile: bool,
+    pub last_file: Option<String>,
 }
 
 impl Default for Settings {
@@ -408,15 +413,52 @@ impl Default for Settings {
             show_settings_window: false,
             active_tab: SettingsTab::Appearance,
             auto_compile: true,
+            last_file: None,
         }
     }
 }
 
-#[derive(Clone)]
-struct OutlineItem {
+impl Settings {
+    fn path() -> PathBuf {
+        if let Some(proj_dirs) = directories::ProjectDirs::from("com", "typesafe", "typesafe") {
+            let config_dir = proj_dirs.config_dir();
+            if !config_dir.exists() {
+                let _ = std::fs::create_dir_all(config_dir);
+            }
+            config_dir.join("settings.json")
+        } else {
+            PathBuf::from("settings.json")
+        }
+    }
+
+    fn load() -> Self {
+        let path = Self::path();
+        if path.exists() {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if let Ok(settings) = serde_json::from_str(&content) {
+                    return settings;
+                }
+            }
+        }
+        Self::default()
+    }
+
+    fn save(&self) {
+        let path = Self::path();
+        if let Ok(content) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(path, content);
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct StructureNode {
     label: String,
+    file_path: String,
     line: usize,
     level: usize,
+    children: Vec<StructureNode>,
+    expanded: bool,
 }
 
 struct TypesafeApp {
@@ -426,7 +468,7 @@ struct TypesafeApp {
     current_dir: std::path::PathBuf,
     root_file: Option<String>,
     show_file_panel: bool,
-    outline_items: Vec<OutlineItem>,
+    outline_nodes: Vec<StructureNode>,
     labels: Vec<String>,
     bib_items: Vec<String>,
     context_menu_word: Option<String>,
@@ -522,7 +564,9 @@ impl Default for TypesafeApp {
         let syntax_set = SyntaxSet::load_defaults_newlines();
         let theme_set = ThemeSet::load_defaults();
 
-        let current_dir = if std::path::Path::new("examples").exists() {
+        let settings = Settings::load();
+
+        let mut current_dir = if std::path::Path::new("examples").exists() {
             std::path::PathBuf::from("examples")
         } else {
             std::path::PathBuf::from(".")
@@ -531,13 +575,27 @@ impl Default for TypesafeApp {
         // Try to find a default tex file
         let mut default_file = "test.tex".to_string();
         let mut found_file = false;
-        if let Ok(entries) = std::fs::read_dir(&current_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().map_or(false, |ext| ext == "tex") {
-                    default_file = path.to_string_lossy().to_string();
-                    found_file = true;
-                    break;
+
+        if let Some(last) = &settings.last_file {
+            let path = std::path::Path::new(last);
+            if path.exists() {
+                default_file = last.clone();
+                found_file = true;
+                if let Some(parent) = path.parent() {
+                    current_dir = parent.to_path_buf();
+                }
+            }
+        }
+
+        if !found_file {
+            if let Ok(entries) = std::fs::read_dir(&current_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().map_or(false, |ext| ext == "tex") {
+                        default_file = path.to_string_lossy().to_string();
+                        found_file = true;
+                        break;
+                    }
                 }
             }
         }
@@ -583,7 +641,7 @@ impl Default for TypesafeApp {
             current_dir,
             root_file: None,
             show_file_panel: true,
-            outline_items: Vec::new(),
+            outline_nodes: Vec::new(),
             labels: Vec::new(),
             bib_items: Vec::new(),
             context_menu_word: None,
@@ -632,7 +690,7 @@ impl Default for TypesafeApp {
             page_sizes: std::collections::HashMap::new(),
             pending_scroll_target: None,
             pending_cursor_scroll: None,
-            settings: Settings::default(),
+            settings,
             completion_suggestions: Vec::new(),
             show_completions: false,
             completion_popup_pos: egui::Pos2::ZERO,
@@ -925,62 +983,137 @@ impl TypesafeApp {
     }
 
     fn update_outline(&mut self) {
-        let mut items = Vec::new();
-        let mut labels = Vec::new();
+        self.outline_nodes.clear();
+        self.labels.clear();
+        self.bib_items.clear();
 
-        // Regex for sections
-        let re_section = regex::Regex::new(r"\\(part|chapter|section|subsection|subsubsection)\*?\{([^}]+)\}").unwrap();
-        // Regex for labels
-        let re_label = regex::Regex::new(r"\\label\{([^}]+)\}").unwrap();
+        let entry_file = if let Some(root) = &self.root_file {
+            root.clone()
+        } else {
+            self.file_path.clone()
+        };
 
-        for (line_idx, line) in self.editor_content.lines().enumerate() {
-            if let Some(caps) = re_section.captures(line) {
-                let type_str = caps.get(1).map_or("", |m| m.as_str());
-                let title = caps.get(2).map_or("", |m| m.as_str());
+        if entry_file.is_empty() { return; }
 
-                let level = match type_str {
-                    "part" => 0,
-                    "chapter" => 0,
-                    "section" => 1,
-                    "subsection" => 2,
-                    "subsubsection" => 3,
-                    _ => 1,
-                };
-
-                items.push(OutlineItem {
-                    label: title.to_string(),
-                    line: line_idx,
-                    level,
-                });
-            }
-
-            if let Some(caps) = re_label.captures(line) {
-                if let Some(label) = caps.get(1) {
-                    labels.push(label.as_str().to_string());
-                }
-            }
+        struct FlatItem {
+            label: String,
+            file: String,
+            line: usize,
+            level: usize,
         }
-        self.outline_items = items;
-        self.labels = labels;
 
-        // Scan bibliography
-        let mut bib_items = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&self.current_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().map_or(false, |ext| ext == "bib") {
-                    if let Ok(content) = std::fs::read_to_string(&path) {
-                        let re_bib = regex::Regex::new(r"@\w+\{([^,]+),").unwrap();
-                        for cap in re_bib.captures_iter(&content) {
-                            if let Some(key) = cap.get(1) {
-                                bib_items.push(key.as_str().to_string());
-                            }
-                        }
+        let mut all_items: Vec<FlatItem> = Vec::new();
+        let mut all_labels: Vec<String> = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+
+        let active_path_buf = std::fs::canonicalize(std::path::Path::new(&self.file_path))
+            .unwrap_or_else(|_| std::path::Path::new(&self.file_path).to_path_buf());
+
+        // Recursive processor
+        fn process(
+            path: std::path::PathBuf,
+            display_path: String,
+            visited: &mut std::collections::HashSet<std::path::PathBuf>,
+            items: &mut Vec<FlatItem>,
+            labels: &mut Vec<String>,
+            active_path: &std::path::Path,
+            active_content: &str,
+        ) {
+            let canon = std::fs::canonicalize(&path).unwrap_or(path.clone());
+            if visited.contains(&canon) { return; }
+            visited.insert(canon.clone());
+
+            let content = if canon == active_path {
+                active_content.to_string()
+            } else {
+                 match std::fs::read_to_string(&path) {
+                    Ok(c) => c,
+                    Err(_) => return,
+                 }
+            };
+
+            let parent = path.parent().unwrap_or(std::path::Path::new("."));
+            let re_section = regex::Regex::new(r"\\(part|chapter|section|subsection|subsubsection)\*?\{([^}]+)\}").unwrap();
+            let re_label = regex::Regex::new(r"\\label\{([^}]+)\}").unwrap();
+            let re_input = regex::Regex::new(r"\\(?:input|include)\{([^}]+)\}").unwrap();
+
+            for (line_idx, line) in content.lines().enumerate() {
+                let clean_line = if let Some(idx) = line.find('%') { &line[..idx] } else { line };
+
+                if let Some(cap) = re_input.captures(clean_line) {
+                    if let Some(rel) = cap.get(1) {
+                        let mut p_str = rel.as_str().to_string();
+                        if !p_str.ends_with(".tex") { p_str.push_str(".tex"); }
+                        let sub_path = parent.join(&p_str);
+                        process(sub_path, p_str, visited, items, labels, active_path, active_content);
                     }
                 }
+
+                if let Some(caps) = re_section.captures(clean_line) {
+                    let type_str = caps.get(1).map_or("", |m| m.as_str());
+                    let title = caps.get(2).map_or("", |m| m.as_str());
+                    let level = match type_str {
+                        "part" => 0, "chapter" => 0, "section" => 1, "subsection" => 2, "subsubsection" => 3, _ => 4,
+                    };
+                    items.push(FlatItem {
+                        label: title.to_string(),
+                        file: display_path.clone(),
+                        line: line_idx,
+                        level,
+                    });
+                }
+                 if let Some(caps) = re_label.captures(clean_line) {
+                    if let Some(l) = caps.get(1) { labels.push(l.as_str().to_string()); }
+                }
             }
         }
-        self.bib_items = bib_items;
+
+        let entry_path = if std::path::Path::new(&entry_file).is_absolute() {
+             std::path::PathBuf::from(&entry_file)
+        } else {
+             self.current_dir.join(&entry_file)
+        };
+
+        process(entry_path, entry_file, &mut visited, &mut all_items, &mut all_labels, &active_path_buf, &self.editor_content);
+
+        // Build Tree
+        fn insert(nodes: &mut Vec<StructureNode>, item: FlatItem) {
+             if let Some(last) = nodes.last_mut() {
+                 if last.level < item.level {
+                     insert(&mut last.children, item);
+                     return;
+                 }
+             }
+             nodes.push(StructureNode {
+                 label: item.label,
+                 file_path: item.file,
+                 line: item.line,
+                 level: item.level,
+                 children: Vec::new(),
+                 expanded: true,
+             });
+        }
+
+        let mut roots = Vec::new();
+        for item in all_items {
+            insert(&mut roots, item);
+        }
+        self.outline_nodes = roots;
+        self.labels = all_labels;
+
+        // Scan bibliography (naive: scan all .bib in current dir)
+        if let Ok(entries) = std::fs::read_dir(&self.current_dir) {
+            for entry in entries.flatten() {
+                 if entry.path().extension().map_or(false, |e| e == "bib") {
+                    if let Ok(c) = std::fs::read_to_string(entry.path()) {
+                        let re = regex::Regex::new(r"@\w+\{([^,]+),").unwrap();
+                        for cap in re.captures_iter(&c) {
+                            if let Some(k) = cap.get(1) { self.bib_items.push(k.as_str().to_string()); }
+                        }
+                    }
+                 }
+            }
+        }
     }
 
     fn check_syntax(&self, text: &str) -> Vec<std::ops::Range<usize>> {
@@ -1159,32 +1292,39 @@ impl TypesafeApp {
     }
 
     fn insert_command(&mut self, ctx: &egui::Context, command: &str) {
+        self.insert_snippet(ctx, command);
+    }
+
+    fn insert_snippet(&mut self, ctx: &egui::Context, snippet: &str) {
+        // Simple snippet parser: replaces $1, $2, etc with empty string and places cursor at $1
+        let mut final_text = snippet.to_string();
+        let mut selection_range = None;
+
+        // Find $1
+        if let Some(idx) = final_text.find("$1") {
+            final_text.replace_range(idx..idx+2, "");
+            selection_range = Some(idx);
+        }
+
         if let Some(mut state) = egui::TextEdit::load_state(ctx, egui::Id::new("main_editor")) {
             if let Some(range) = state.cursor.char_range() {
                 let cursor = range.primary.index;
-                self.editor_content.insert_str(cursor, command);
+                self.editor_content.insert_str(cursor, &final_text);
 
                 // Calculate new cursor position
-                let mut new_cursor_idx = cursor + command.len();
-
-                // If command contains braces {}, place cursor inside them
-                if let Some(offset) = command.find("{}") {
-                    new_cursor_idx = cursor + offset + 1;
-                } else if let Some(offset) = command.find("}{") { // for \frac
-                    new_cursor_idx = cursor + offset + 1;
-                } else if let Some(offset) = command.find("$$") { // for inline math
-                    new_cursor_idx = cursor + offset + 1;
-                } else if let Some(offset) = command.find("[]") {
-                    new_cursor_idx = cursor + offset + 1;
-                }
+                let new_cursor_idx = if let Some(rel_idx) = selection_range {
+                    cursor + rel_idx
+                } else {
+                    cursor + final_text.len()
+                };
 
                 state.cursor.set_char_range(Some(CCursorRange::one(CCursor::new(new_cursor_idx))));
                 state.store(ctx, egui::Id::new("main_editor"));
             } else {
-                self.editor_content.push_str(command);
+                self.editor_content.push_str(&final_text);
             }
         } else {
-            self.editor_content.push_str(command);
+            self.editor_content.push_str(&final_text);
         }
         self.is_dirty = true;
         ctx.request_repaint();
@@ -1612,6 +1752,8 @@ impl eframe::App for TypesafeApp {
                     if ui.button("New").clicked() {
                         self.editor_content = "\\documentclass{article}\n\\begin{document}\n\n\\end{document}".to_string();
                         self.file_path = "untitled.tex".to_string();
+                        self.settings.last_file = None;
+                        self.settings.save();
                         ui.close_menu();
                     }
                     ui.separator();
@@ -1620,6 +1762,8 @@ impl eframe::App for TypesafeApp {
                             self.file_path = path.to_string_lossy().to_string();
                             let path_str = self.file_path.clone();
                             self.load_file(&path_str);
+                            self.settings.last_file = Some(self.file_path.clone());
+                            self.settings.save();
                             if let Some(parent) = path.parent() {
                                 self.current_dir = parent.to_path_buf();
                             }
@@ -1778,9 +1922,10 @@ impl eframe::App for TypesafeApp {
             ui.add_space(4.0);
         });
 
-        if self.settings.show_settings_window {
+        let mut show_settings = self.settings.show_settings_window;
+        if show_settings {
             egui::Window::new("Settings")
-                .open(&mut self.settings.show_settings_window)
+                .open(&mut show_settings)
                 .resizable(true)
                 .default_width(400.0)
                 .show(ctx, |ui| {
@@ -1803,7 +1948,9 @@ impl eframe::App for TypesafeApp {
                                 .width(200.0)
                                 .show_ui(ui, |ui| {
                                     for &preset in ThemePreset::all() {
-                                        ui.selectable_value(&mut self.settings.theme, preset, preset.name());
+                                        if ui.selectable_value(&mut self.settings.theme, preset, preset.name()).changed() {
+                                            self.settings.save();
+                                        }
                                     }
                                 });
 
@@ -1819,17 +1966,49 @@ impl eframe::App for TypesafeApp {
                                 .width(200.0)
                                 .show_ui(ui, |ui| {
                                     for &accent in AccentColor::all() {
-                                        ui.selectable_value(&mut self.settings.accent, accent, accent.name());
+                                        if ui.selectable_value(&mut self.settings.accent, accent, accent.name()).changed() {
+                                            self.settings.save();
+                                        }
                                     }
                                 });
                         },
                         SettingsTab::Permissions => {
-                            ui.label("Permission settings will go here.");
+                            ui.label("System Integration");
+                            ui.add_space(8.0);
+
+                            #[cfg(windows)]
+                            if ui.button("Set as Default for .tex files").clicked() {
+                                if let Ok(exe_path) = std::env::current_exe() {
+                                    let exe = exe_path.to_string_lossy();
+                                    let hkcu = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
+                                    let path = std::path::Path::new("Software\\Classes\\.tex");
+                                    if let Ok((key, _)) = hkcu.create_subkey(&path) {
+                                        let _ = key.set_value("", &"Typesafe.Document");
+                                    }
+
+                                    let path = std::path::Path::new("Software\\Classes\\Typesafe.Document");
+                                    if let Ok((key, _)) = hkcu.create_subkey(&path) {
+                                        let _ = key.set_value("", &"LaTeX Document");
+                                    }
+
+                                    let path = std::path::Path::new("Software\\Classes\\Typesafe.Document\\DefaultIcon");
+                                    if let Ok((key, _)) = hkcu.create_subkey(&path) {
+                                        let _ = key.set_value("", &format!("{},0", exe));
+                                    }
+
+                                    let path = std::path::Path::new("Software\\Classes\\Typesafe.Document\\shell\\open\\command");
+                                    if let Ok((key, _)) = hkcu.create_subkey(&path) {
+                                        let _ = key.set_value("", &format!("\"{}\" \"%1\"", exe));
+                                    }
+                                }
+                            }
                         },
                         SettingsTab::APIs => {
                             ui.heading("Tectonic Engine");
                             ui.add_space(4.0);
-                            ui.checkbox(&mut self.settings.auto_compile, "Auto-compile on Save");
+                            if ui.checkbox(&mut self.settings.auto_compile, "Auto-compile on Save").changed() {
+                                self.settings.save();
+                            }
                             ui.add_space(8.0);
                             if ui.button("🗑 Clear Package Cache").clicked() {
                                 // Placeholder for clearing cache logic
@@ -1840,6 +2019,7 @@ impl eframe::App for TypesafeApp {
                     }
                 });
         }
+        self.settings.show_settings_window = show_settings;
 
         // ====== LEFT PANEL (FILES) ======
         if self.show_file_panel {
@@ -1939,6 +2119,8 @@ impl eframe::App for TypesafeApp {
                                                 self.file_path = path.to_string_lossy().to_string();
                                                 let path_str = self.file_path.clone();
                                                 self.load_file(&path_str);
+                                                self.settings.last_file = Some(self.file_path.clone());
+                                                self.settings.save();
                                                 self.update_outline();
                                             }
                                         }
@@ -1959,19 +2141,71 @@ impl eframe::App for TypesafeApp {
                          );
                          ui.separator();
                          egui::ScrollArea::vertical().show(ui, |ui| {
-                            for item in &self.outline_items {
-                                ui.horizontal(|ui| {
-                                    ui.add_space(item.level as f32 * 10.0);
-                                    if ui.button(egui::RichText::new(&item.label)).clicked() {
-                                        if let Some(mut state) = egui::TextEdit::load_state(ctx, egui::Id::new("main_editor")) {
-                                            let char_idx = self.editor_content.lines().take(item.line).map(|l| l.len() + 1).sum::<usize>();
-                                            state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(char_idx))));
-                                            state.store(ctx, egui::Id::new("main_editor"));
+                            fn render_tree(
+                                ui: &mut egui::Ui,
+                                nodes: &mut Vec<StructureNode>,
+                                ctx: &egui::Context,
+                                jump_action: &mut Option<(String, usize)>
+                            ) {
+                                for node in nodes {
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(node.level as f32 * 10.0);
+                                        let icon = if node.children.is_empty() {
+                                            "•"
+                                        } else if node.expanded {
+                                            "▼"
+                                        } else {
+                                            "▶"
+                                        };
+
+                                        if !node.children.is_empty() {
+                                            if ui.small_button(icon).clicked() {
+                                                node.expanded = !node.expanded;
+                                            }
+                                        } else {
+                                            ui.label(icon);
                                         }
+
+                                        if ui.button(egui::RichText::new(&node.label)).clicked() {
+                                            *jump_action = Some((node.file_path.clone(), node.line));
+                                        }
+                                    });
+
+                                    if node.expanded && !node.children.is_empty() {
+                                        render_tree(ui, &mut node.children, ctx, jump_action);
                                     }
-                                });
+                                }
                             }
-                            if self.outline_items.is_empty() {
+
+                            let mut jump = None;
+                            render_tree(ui, &mut self.outline_nodes, ctx, &mut jump);
+
+                            if let Some((file, line)) = jump {
+                                if file != self.file_path && !file.is_empty() {
+                                    let path_to_load = if std::path::Path::new(&file).is_absolute() {
+                                        std::path::PathBuf::from(&file)
+                                    } else {
+                                        self.current_dir.join(&file)
+                                    };
+
+                                    if path_to_load.exists() {
+                                         self.file_path = path_to_load.to_string_lossy().to_string();
+                                         let p = self.file_path.clone();
+                                         self.load_file(&p);
+                                         self.settings.last_file = Some(self.file_path.clone());
+                                         self.settings.save();
+                                    }
+                                }
+
+                                if let Some(mut state) = egui::TextEdit::load_state(ctx, egui::Id::new("main_editor")) {
+                                    let char_idx = self.editor_content.lines().take(line).map(|l| l.len() + 1).sum::<usize>();
+                                    state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(char_idx))));
+                                    state.store(ctx, egui::Id::new("main_editor"));
+                                    ctx.memory_mut(|m| m.request_focus(egui::Id::new("main_editor")));
+                                }
+                            }
+
+                            if self.outline_nodes.is_empty() {
                                 ui.label(egui::RichText::new("No sections.").small().italics());
                             }
                         });
@@ -2324,19 +2558,26 @@ impl eframe::App for TypesafeApp {
             // Quick insert toolbar
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
-                if ui.button(egui::RichText::new("𝐁").strong()).on_hover_text("Bold").clicked() { self.insert_command(ctx, "\\textbf{}"); }
-                if ui.button(egui::RichText::new("𝐼").italics()).on_hover_text("Italic").clicked() { self.insert_command(ctx, "\\textit{}"); }
-                if ui.button(egui::RichText::new("U").underline()).on_hover_text("Underline").clicked() { self.insert_command(ctx, "\\underline{}"); }
+                if ui.button(egui::RichText::new("𝐁").strong()).on_hover_text("Bold").clicked() { self.insert_snippet(ctx, "\\textbf{$1}"); }
+                if ui.button(egui::RichText::new("𝐼").italics()).on_hover_text("Italic").clicked() { self.insert_snippet(ctx, "\\textit{$1}"); }
+                if ui.button(egui::RichText::new("U").underline()).on_hover_text("Underline").clicked() { self.insert_snippet(ctx, "\\underline{$1}"); }
                 ui.separator();
-                if ui.button("H1").on_hover_text("Section").clicked() { self.insert_command(ctx, "\\section{}"); }
-                if ui.button("H2").on_hover_text("Subsection").clicked() { self.insert_command(ctx, "\\subsection{}"); }
-                if ui.button("H3").on_hover_text("Subsubsection").clicked() { self.insert_command(ctx, "\\subsubsection{}"); }
+                if ui.button("H1").on_hover_text("Section").clicked() { self.insert_snippet(ctx, "\\section{$1}"); }
+                if ui.button("H2").on_hover_text("Subsection").clicked() { self.insert_snippet(ctx, "\\subsection{$1}"); }
+                if ui.button("H3").on_hover_text("Subsubsection").clicked() { self.insert_snippet(ctx, "\\subsubsection{$1}"); }
                 ui.separator();
-                if ui.button("•").on_hover_text("Itemize").clicked() { self.insert_command(ctx, "\\begin{itemize}\n    \\item \n\\end{itemize}"); }
-                if ui.button("1.").on_hover_text("Enumerate").clicked() { self.insert_command(ctx, "\\begin{enumerate}\n    \\item \n\\end{enumerate}"); }
+                if ui.button("α").on_hover_text("Alpha").clicked() { self.insert_snippet(ctx, "\\alpha"); }
+                if ui.button("β").on_hover_text("Beta").clicked() { self.insert_snippet(ctx, "\\beta"); }
+                if ui.button("π").on_hover_text("Pi").clicked() { self.insert_snippet(ctx, "\\pi"); }
+                if ui.button("∑").on_hover_text("Sum").clicked() { self.insert_snippet(ctx, "\\sum_{$1}^{$2}"); }
+                if ui.button("∫").on_hover_text("Integral").clicked() { self.insert_snippet(ctx, "\\int_{$1}^{$2}"); }
+                if ui.button("∞").on_hover_text("Infinity").clicked() { self.insert_snippet(ctx, "\\infty"); }
                 ui.separator();
-                if ui.button("Title").on_hover_text("Title").clicked() { self.insert_command(ctx, "\\title{}"); }
-                if ui.button("Auth").on_hover_text("Author").clicked() { self.insert_command(ctx, "\\author{}"); }
+                if ui.button("•").on_hover_text("Itemize").clicked() { self.insert_snippet(ctx, "\\begin{itemize}\n    \\item $1\n\\end{itemize}"); }
+                if ui.button("1.").on_hover_text("Enumerate").clicked() { self.insert_snippet(ctx, "\\begin{enumerate}\n    \\item $1\n\\end{enumerate}"); }
+                ui.separator();
+                if ui.button("Title").on_hover_text("Title").clicked() { self.insert_snippet(ctx, "\\title{$1}"); }
+                if ui.button("Auth").on_hover_text("Author").clicked() { self.insert_snippet(ctx, "\\author{$1}"); }
             });
             ui.separator();
 
@@ -2537,6 +2778,37 @@ impl eframe::App for TypesafeApp {
                 }
                 if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                     self.show_completions = false;
+                }
+            } else {
+                // Snippet Tab Navigation
+                if ctx.input(|i| i.key_pressed(egui::Key::Tab) && i.modifiers.is_none()) {
+                    if let Some(mut state) = egui::TextEdit::load_state(ctx, egui::Id::new("main_editor")) {
+                        if let Some(range) = state.cursor.char_range() {
+                            let cursor_idx = range.primary.index;
+                            // Search for next $digit placeholder
+                            if let Some(rel_idx) = text[cursor_idx..].find('$') {
+                                let target_idx = cursor_idx + rel_idx;
+                                if target_idx + 1 < text.len() {
+                                    let next_char = text.chars().nth(target_idx + 1).unwrap_or(' ');
+                                    if next_char.is_digit(10) {
+                                        // Found a placeholder (e.g., $2)
+                                        ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab));
+
+                                        // Remove the marker
+                                        text.replace_range(target_idx..target_idx+2, "");
+
+                                        // Move cursor to the placeholder position
+                                        state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(target_idx))));
+                                        state.store(ctx, egui::Id::new("main_editor"));
+
+                                        // Update content immediately
+                                        self.editor_content = text.clone();
+                                        self.is_dirty = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -2806,12 +3078,17 @@ impl eframe::App for TypesafeApp {
                                 self.show_completions = false;
                                 self.completion_suggestions.clear();
 
-                                if text_slice.ends_with("\\ref{") {
+                                // Regex-based trigger for robustness (allows spaces like \ref { )
+                                let trigger_regex = regex::Regex::new(r"\\(ref|cite)\s*\{$").unwrap();
+
+                                if let Some(cap) = trigger_regex.captures(text_slice) {
+                                    let command = cap.get(1).unwrap().as_str();
                                     self.show_completions = true;
-                                    self.completion_suggestions = self.labels.iter().map(|l| (l.clone(), "Label".to_string())).collect();
-                                } else if text_slice.ends_with("\\cite{") {
-                                    self.show_completions = true;
-                                    self.completion_suggestions = self.bib_items.iter().map(|b| (b.clone(), "Bib".to_string())).collect();
+                                    if command == "ref" {
+                                        self.completion_suggestions = self.labels.iter().map(|l| (l.clone(), "Label".to_string())).collect();
+                                    } else {
+                                        self.completion_suggestions = self.bib_items.iter().map(|b| (b.clone(), "Bib".to_string())).collect();
+                                    }
                                 }
 
                                 if self.show_completions {
@@ -3406,9 +3683,10 @@ fn load_icon() -> Option<egui::IconData> {
     // Try to update icon from SVG if present
     let svg_path = std::path::Path::new("web/logo.svg");
     let png_path = std::path::Path::new("icon.png");
+    let ico_path = std::path::Path::new("icon.ico");
 
     if svg_path.exists() {
-        let should_update = if !png_path.exists() {
+        let should_update = if !png_path.exists() || !ico_path.exists() {
             true
         } else if let (Ok(m1), Ok(m2)) = (svg_path.metadata(), png_path.metadata()) {
             if let (Ok(t1), Ok(t2)) = (m1.modified(), m2.modified()) {
@@ -3440,6 +3718,13 @@ fn load_icon() -> Option<egui::IconData> {
                          let transform = resvg::tiny_skia::Transform::from_scale(scale, scale);
                          rtree.render(transform, &mut pixmap.as_mut());
                          let _ = pixmap.save_png(png_path);
+
+                         // Generate ICO for Windows build
+                         if let Ok(png_data) = pixmap.encode_png() {
+                             if let Ok(img) = image::load_from_memory(&png_data) {
+                                 let _ = img.save_with_format("icon.ico", image::ImageFormat::Ico);
+                             }
+                         }
                      }
                 }
             }

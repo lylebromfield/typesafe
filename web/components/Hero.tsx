@@ -15,9 +15,9 @@ const Hero: React.FC = () => {
       </h1>
 
       <p className="text-xl md:text-2xl text-gruvbox-gray max-w-2xl mb-12 font-light leading-relaxed">
-        A modern, blazing fast{" "}
+        An intelligent, lightweight{" "}
         <span className="text-gruvbox-orangeBright font-semibold">Rust</span>{" "}
-        based LaTeX editor designed for reliability and speed.
+        based LaTeX editor designed for privacy, reliability, and speed.
       </p>
 
       <div className="flex flex-col sm:flex-row gap-4 w-full sm:w-auto">
