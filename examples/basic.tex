@@ -1,16 +1,41 @@
 \documentclass{article}
 \usepackage[utf8]{inputenc}
+\usepackage{graphicx}
+\usepackage[margin=1.2in]{geometry}
+\usepackage{amsmath}
+\usepackage{hyperref}
+\usepackage{xcolor}
 
-\title{Typesafe}
-\author{Your Name}
-\date{\today}
+\title{\textbf{Typesafe}\\ \large The Modern, Rust-Powered LaTeX Editor}
+\author{Fast \textbullet\ Reliable \textbullet\ Minimalist}
+\date{}
 
 \begin{document}
-
 \maketitle
-
 \section{Introduction}
 
-Welcome to Typesafe! This is a modern LaTeX editor.
+Welcome to Typesafe, a LaTeX editor designed for the modern era. Built on the performance of \textbf{Rust}, it provides a frictionless writing experience without the bloat of traditional TeX distributions.
 
+\begin{figure}[h]
+	\includegraphics[width=0.2\linewidth, height=0.2\linewidth]{icon.png}
+    \centering	
+    \caption{Typesafe logo.}
+\end{figure}
+
+\section{Why Typesafe?}
+
+\begin{itemize}
+    \item \textbf{Zero Configuration:} Powered by the \textit{Tectonic} engine, packages are automatically downloaded as you type.
+    \item \textbf{Instant Preview:} High-performance PDFium rendering ensures your document looks exactly how you intend.
+    \item \textbf{Smart Editing:} Context-aware autocompletion for environments, \texttt{\textbackslash cite} keys, and \texttt{\textbackslash ref} labels.
+\end{itemize}
+
+\section{Mathematical Precision}
+Typesafe excels at rendering complex notation with zero setup required.
+\begin{equation}
+    \mathcal{F}\{f\}(\xi) = \int_{-\infty}^{\infty} f(x) e^{-2\pi i x \xi} \,dx
+\end{equation}
+
+\section{Architecture}
+The editor uses an immediate-mode GUI (egui) for rendering at 60fps, ensuring that the interface remains responsive even with large documents.
 \end{document}

@@ -389,6 +389,7 @@ enum CompilationMsg {
 enum SettingsTab {
     #[default]
     Appearance,
+    Editor,
     Permissions,
     APIs,
 }
@@ -402,8 +403,17 @@ struct Settings {
     #[serde(skip)]
     pub active_tab: SettingsTab,
     pub auto_compile: bool,
+    #[serde(default)]
     pub last_file: Option<String>,
+    #[serde(default = "default_true")]
+    pub autosave_timer: bool,
+    #[serde(default = "default_true")]
+    pub autosave_on_compile: bool,
+    #[serde(default = "default_true")]
+    pub autosave_on_change: bool,
 }
+
+fn default_true() -> bool { true }
 
 impl Default for Settings {
     fn default() -> Self {
@@ -414,6 +424,9 @@ impl Default for Settings {
             active_tab: SettingsTab::Appearance,
             auto_compile: true,
             last_file: None,
+            autosave_timer: true,
+            autosave_on_compile: true,
+            autosave_on_change: true,
         }
     }
 }
@@ -451,14 +464,37 @@ impl Settings {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+enum NodeKind {
+    Section,
+    Figure,
+    Table,
+    Theorem,
+    Citation,
+    Unknown,
+}
+
 #[derive(Clone, Debug)]
 struct StructureNode {
     label: String,
     file_path: String,
     line: usize,
     level: usize,
+    kind: NodeKind,
     children: Vec<StructureNode>,
     expanded: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct LatexItem {
+    trigger: String,
+    completion: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct LatexData {
+    commands: Vec<LatexItem>,
+    environments: Vec<LatexItem>,
 }
 
 struct TypesafeApp {
@@ -553,6 +589,9 @@ struct TypesafeApp {
     search_whole_word: bool,
     search_matches: Vec<(usize, usize)>,
     search_match_index: usize,
+    last_save_time: f64,
+    latex_commands: Vec<LatexItem>,
+    latex_environments: Vec<LatexItem>,
 }
 
 impl Default for TypesafeApp {
@@ -563,6 +602,9 @@ impl Default for TypesafeApp {
         // Load syntax highlighting data
         let syntax_set = SyntaxSet::load_defaults_newlines();
         let theme_set = ThemeSet::load_defaults();
+
+        let latex_data: LatexData = serde_json::from_str(include_str!("../latex_data.json"))
+            .unwrap_or(LatexData { commands: Vec::new(), environments: Vec::new() });
 
         let settings = Settings::load();
 
@@ -616,7 +658,8 @@ impl Default for TypesafeApp {
         } else {
              // Attempt download in a separate thread
              std::thread::spawn(|| {
-                 if let Ok(resp) = reqwest::blocking::get("https://raw.githubusercontent.com/dwyl/english-words/master/words_alpha.txt") {
+                 // Using atebits/Words for a better standard english dictionary
+                 if let Ok(resp) = reqwest::blocking::get("https://raw.githubusercontent.com/atebits/Words/master/Words/en.txt") {
                      if let Ok(text) = resp.text() {
                          let _ = std::fs::write("dictionary.txt", &text);
                      }
@@ -696,6 +739,8 @@ impl Default for TypesafeApp {
             completion_popup_pos: egui::Pos2::ZERO,
             completion_popup_rect: None,
             completion_selected_index: 0,
+            latex_commands: latex_data.commands,
+            latex_environments: latex_data.environments,
 
             show_search: false,
             search_query: String::new(),
@@ -704,6 +749,7 @@ impl Default for TypesafeApp {
             search_whole_word: false,
             search_matches: Vec::new(),
             search_match_index: 0,
+            last_save_time: 0.0,
         }
     }
 }
@@ -829,13 +875,13 @@ impl TypesafeApp {
         }
     }
 
-    fn save_file(&mut self) {
+    fn save_file(&mut self, trigger_compile: bool) {
         match std::fs::write(&self.file_path, &self.editor_content) {
             Ok(_) => {
                 self.is_dirty = false;
                 self.compilation_log = "File saved successfully\n".to_string();
                 self.update_outline();
-                if self.settings.auto_compile {
+                if self.settings.auto_compile && trigger_compile {
                     self.compile();
                 }
             }
@@ -848,7 +894,7 @@ impl TypesafeApp {
     fn save_file_as(&mut self) {
         if let Some(path) = rfd::FileDialog::new().add_filter("LaTeX", &["tex"]).save_file() {
             self.file_path = path.to_string_lossy().to_string();
-            self.save_file();
+            self.save_file(true);
         }
     }
 
@@ -867,6 +913,13 @@ impl TypesafeApp {
     }
 
     fn compile(&mut self) {
+        if self.settings.autosave_on_compile && self.is_dirty {
+            if !self.file_path.is_empty() && self.file_path != "untitled.tex" && !self.file_path.ends_with("untitled.tex") {
+                 let _ = std::fs::write(&self.file_path, &self.editor_content);
+                 self.is_dirty = false;
+                 self.update_outline();
+            }
+        }
         let tx = self.compile_tx.clone();
         let content = self.editor_content.clone();
         let file_path = self.file_path.clone();
@@ -1000,6 +1053,7 @@ impl TypesafeApp {
             file: String,
             line: usize,
             level: usize,
+            kind: NodeKind,
         }
 
         let mut all_items: Vec<FlatItem> = Vec::new();
@@ -1037,6 +1091,11 @@ impl TypesafeApp {
             let re_label = regex::Regex::new(r"\\label\{([^}]+)\}").unwrap();
             let re_input = regex::Regex::new(r"\\(?:input|include)\{([^}]+)\}").unwrap();
 
+            // New regexes for Semantic Blocks
+            let re_env = regex::Regex::new(r"\\begin\{(figure|table|theorem|lemma|definition)\}(?:\[.*\])?").unwrap();
+            let re_caption = regex::Regex::new(r"\\caption\{([^}]+)\}").unwrap();
+            let re_cite = regex::Regex::new(r"\\cite\{([^}]+)\}").unwrap();
+
             for (line_idx, line) in content.lines().enumerate() {
                 let clean_line = if let Some(idx) = line.find('%') { &line[..idx] } else { line };
 
@@ -1060,9 +1119,49 @@ impl TypesafeApp {
                         file: display_path.clone(),
                         line: line_idx,
                         level,
+                        kind: NodeKind::Section,
                     });
                 }
-                 if let Some(caps) = re_label.captures(clean_line) {
+
+                // Figures/Tables/Theorems
+                if let Some(caps) = re_env.captures(clean_line) {
+                    let type_str = caps.get(1).map_or("block", |m| m.as_str());
+                    let kind = match type_str {
+                        "figure" => NodeKind::Figure,
+                        "table" => NodeKind::Table,
+                        "theorem" | "lemma" | "definition" => NodeKind::Theorem,
+                        _ => NodeKind::Unknown,
+                    };
+                    let mut label = type_str.to_string();
+                    if let Some(cap_match) = re_caption.captures(clean_line) {
+                        if let Some(c) = cap_match.get(1) {
+                            label = format!("{}: {}", type_str, c.as_str());
+                        }
+                    }
+
+                    items.push(FlatItem {
+                        label,
+                        file: display_path.clone(),
+                        line: line_idx,
+                        level: 4, // Inside sections
+                        kind,
+                    });
+                }
+
+                // Citations
+                if let Some(caps) = re_cite.captures(clean_line) {
+                    if let Some(c) = caps.get(1) {
+                        items.push(FlatItem {
+                            label: format!("Cite: {}", c.as_str()),
+                            file: display_path.clone(),
+                            line: line_idx,
+                            level: 4,
+                            kind: NodeKind::Citation,
+                        });
+                    }
+                }
+
+                if let Some(caps) = re_label.captures(clean_line) {
                     if let Some(l) = caps.get(1) { labels.push(l.as_str().to_string()); }
                 }
             }
@@ -1089,6 +1188,7 @@ impl TypesafeApp {
                  file_path: item.file,
                  line: item.line,
                  level: item.level,
+                 kind: item.kind,
                  children: Vec::new(),
                  expanded: true,
              });
@@ -1259,33 +1359,61 @@ impl TypesafeApp {
              return errors;
         }
 
-        let mut start_idx = 0;
-        for (i, c) in text.char_indices() {
-             if !c.is_alphabetic() {
-                 if i > start_idx {
-                     let word = &text[start_idx..i];
-                     let lower = word.to_lowercase();
-                     // Filter out LaTeX commands and check dictionary
-                     if !word.starts_with('\\') && !self.dictionary.contains(&lower) && !self.user_dictionary.contains(&lower) && !self.ignored_words.contains(&lower) {
-                         let is_command = start_idx > 0 && text[..start_idx].ends_with('\\');
-                         if !is_command {
-                            errors.push(start_idx..i);
-                         }
+        let mut check_word = |start: usize, end: usize| {
+             let word = &text[start..end];
+             let lower = word.to_lowercase();
+
+             // Ignore LaTeX commands
+             if start > 0 && text[..start].ends_with('\\') { return; }
+
+             // Ignore words in specific commands like \cite{...}, \usepackage{...}
+             let preceding = &text[0..start];
+             if let Some(brace_idx) = preceding.rfind('{') {
+                 let before_brace = preceding[..brace_idx].trim_end();
+                 if before_brace.ends_with("\\cite") ||
+                    before_brace.ends_with("\\ref") ||
+                    before_brace.ends_with("\\label") ||
+                    before_brace.ends_with("\\usepackage") ||
+                    before_brace.ends_with("\\documentclass") ||
+                    before_brace.ends_with("\\input") ||
+                    before_brace.ends_with("\\include") ||
+                    before_brace.ends_with("\\bibliographystyle") ||
+                    before_brace.ends_with("\\bibliography") {
+                     // Verify we haven't closed the brace yet
+                     let after_brace = &preceding[brace_idx+1..];
+                     if !after_brace.contains('}') {
+                         return;
                      }
                  }
-                 start_idx = i + 1;
              }
+
+             if !self.dictionary.contains(&lower)
+                && !self.user_dictionary.contains(&lower)
+                && !self.ignored_words.contains(&lower)
+             {
+                  errors.push(start..end);
+             }
+        };
+
+        let mut in_word = false;
+        let mut start_idx = 0;
+
+        for (i, c) in text.char_indices() {
+            if c.is_alphabetic() {
+                if !in_word {
+                    in_word = true;
+                    start_idx = i;
+                }
+            } else {
+                if in_word {
+                    in_word = false;
+                    check_word(start_idx, i);
+                }
+            }
         }
-        // Last word
-        if start_idx < text.len() {
-             let word = &text[start_idx..];
-             let lower = word.to_lowercase();
-             if !word.starts_with('\\') && !self.dictionary.contains(&lower) && !self.user_dictionary.contains(&lower) && !self.ignored_words.contains(&lower) {
-                  let is_command = start_idx > 0 && text[..start_idx].ends_with('\\');
-                  if !is_command {
-                      errors.push(start_idx..text.len());
-                  }
-             }
+
+        if in_word {
+            check_word(start_idx, text.len());
         }
 
         errors
@@ -1618,6 +1746,17 @@ impl eframe::App for TypesafeApp {
             self.compile();
         }
 
+        let now = ctx.input(|i| i.time);
+        if self.settings.autosave_timer && self.is_dirty {
+            if now - self.last_save_time > 30.0 {
+                 if !self.file_path.is_empty() && !self.file_path.ends_with("untitled.tex") {
+                     self.save_file(false);
+                     self.compilation_log = "Autosaved.\n".to_string();
+                 }
+                 self.last_save_time = now;
+            }
+        }
+
 
 
         // Apply theme
@@ -1666,7 +1805,7 @@ impl eframe::App for TypesafeApp {
         if ctx.input(|i| {
             i.key_pressed(egui::Key::S) && (i.modifiers.ctrl || i.modifiers.command)
         }) {
-            self.save_file();
+            self.save_file(true);
         }
 
         // Block Commenting (Ctrl+/)
@@ -1750,24 +1889,64 @@ impl eframe::App for TypesafeApp {
                 // File Menu
                 ui.menu_button("File", |ui| {
                     if ui.button("New").clicked() {
-                        self.editor_content = "\\documentclass{article}\n\\begin{document}\n\n\\end{document}".to_string();
-                        self.file_path = "untitled.tex".to_string();
-                        self.settings.last_file = None;
-                        self.settings.save();
-                        ui.close_menu();
+                        let mut proceed = true;
+                        if self.is_dirty {
+                            if self.settings.autosave_on_change {
+                                self.save_file(false);
+                            } else {
+                                let confirmed = rfd::MessageDialog::new()
+                                    .set_title("Unsaved Changes")
+                                    .set_description("Do you want to save changes to the current file?")
+                                    .set_buttons(rfd::MessageButtons::YesNoCancel)
+                                    .show();
+                                match confirmed {
+                                    rfd::MessageDialogResult::Yes => self.save_file(true),
+                                    rfd::MessageDialogResult::No => {},
+                                    rfd::MessageDialogResult::Cancel => proceed = false,
+                                    _ => {},
+                                }
+                            }
+                        }
+                        if proceed {
+                            self.editor_content = "\\documentclass{article}\n\\begin{document}\n\n\\end{document}".to_string();
+                            self.file_path = self.current_dir.join("untitled.tex").to_string_lossy().to_string();
+                            self.settings.last_file = None;
+                            self.settings.save();
+                            ui.close_menu();
+                        }
                     }
                     ui.separator();
                     if ui.button("Open File...").clicked() {
-                        if let Some(path) = rfd::FileDialog::new().add_filter("LaTeX", &["tex"]).pick_file() {
-                            self.file_path = path.to_string_lossy().to_string();
-                            let path_str = self.file_path.clone();
-                            self.load_file(&path_str);
-                            self.settings.last_file = Some(self.file_path.clone());
-                            self.settings.save();
-                            if let Some(parent) = path.parent() {
-                                self.current_dir = parent.to_path_buf();
+                        let mut proceed = true;
+                        if self.is_dirty {
+                             if self.settings.autosave_on_change {
+                                 self.save_file(false);
+                             } else {
+                                 let confirmed = rfd::MessageDialog::new()
+                                     .set_title("Unsaved Changes")
+                                     .set_description("Do you want to save changes to the current file?")
+                                     .set_buttons(rfd::MessageButtons::YesNoCancel)
+                                     .show();
+                                 match confirmed {
+                                     rfd::MessageDialogResult::Yes => self.save_file(true),
+                                     rfd::MessageDialogResult::No => {},
+                                     rfd::MessageDialogResult::Cancel => proceed = false,
+                                     _ => {},
+                                 }
+                             }
+                        }
+                        if proceed {
+                            if let Some(path) = rfd::FileDialog::new().add_filter("LaTeX", &["tex"]).pick_file() {
+                                self.file_path = path.to_string_lossy().to_string();
+                                let path_str = self.file_path.clone();
+                                self.load_file(&path_str);
+                                self.settings.last_file = Some(self.file_path.clone());
+                                self.settings.save();
+                                if let Some(parent) = path.parent() {
+                                    self.current_dir = parent.to_path_buf();
+                                }
+                                ui.close_menu();
                             }
-                            ui.close_menu();
                         }
                     }
                     if ui.button("Open Folder...").clicked() {
@@ -1778,7 +1957,7 @@ impl eframe::App for TypesafeApp {
                     }
                     ui.separator();
                     if ui.add(egui::Button::new("Save").shortcut_text("Ctrl+S")).clicked() {
-                        self.save_file();
+                        self.save_file(true);
                         ui.close_menu();
                     }
                     if ui.button("Save As...").clicked() {
@@ -1926,11 +2105,15 @@ impl eframe::App for TypesafeApp {
         if show_settings {
             egui::Window::new("Settings")
                 .open(&mut show_settings)
-                .resizable(true)
-                .default_width(400.0)
+                .pivot(egui::Align2::CENTER_CENTER)
+                .default_pos(ctx.screen_rect().center())
+                .fixed_size([500.0, 700.0])
+                .resizable(false)
+                .collapsible(false)
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.selectable_value(&mut self.settings.active_tab, SettingsTab::Appearance, "Appearance");
+                        ui.selectable_value(&mut self.settings.active_tab, SettingsTab::Editor, "Editor");
                         ui.selectable_value(&mut self.settings.active_tab, SettingsTab::Permissions, "Permissions");
                         ui.selectable_value(&mut self.settings.active_tab, SettingsTab::APIs, "APIs");
                     });
@@ -1971,6 +2154,19 @@ impl eframe::App for TypesafeApp {
                                         }
                                     }
                                 });
+                        },
+                        SettingsTab::Editor => {
+                            ui.heading("Autosave");
+                            ui.add_space(4.0);
+                            if ui.checkbox(&mut self.settings.autosave_timer, "Autosave periodically (30s)").changed() {
+                                self.settings.save();
+                            }
+                            if ui.checkbox(&mut self.settings.autosave_on_compile, "Autosave on Compile").changed() {
+                                self.settings.save();
+                            }
+                            if ui.checkbox(&mut self.settings.autosave_on_change, "Autosave on File Switch").changed() {
+                                self.settings.save();
+                            }
                         },
                         SettingsTab::Permissions => {
                             ui.label("System Integration");
@@ -2056,6 +2252,32 @@ impl eframe::App for TypesafeApp {
                                 if ui.button("🔄").on_hover_text("Refresh").clicked() {
                                     ctx.request_repaint();
                                 }
+                                if ui.button("➕").on_hover_text("New File").clicked() {
+                                    let mut proceed = true;
+                                    if self.is_dirty {
+                                        if self.settings.autosave_on_change {
+                                            self.save_file(false);
+                                        } else {
+                                            let confirmed = rfd::MessageDialog::new()
+                                                .set_title("Unsaved Changes")
+                                                .set_description("Do you want to save changes to the current file?")
+                                                .set_buttons(rfd::MessageButtons::YesNoCancel)
+                                                .show();
+                                            match confirmed {
+                                                rfd::MessageDialogResult::Yes => self.save_file(true),
+                                                rfd::MessageDialogResult::No => {},
+                                                rfd::MessageDialogResult::Cancel => proceed = false,
+                                                _ => {},
+                                            }
+                                        }
+                                    }
+                                    if proceed {
+                                        self.editor_content = "\\documentclass{article}\n\\begin{document}\n\n\\end{document}".to_string();
+                                        self.file_path = self.current_dir.join("untitled.tex").to_string_lossy().to_string();
+                                        self.settings.last_file = None;
+                                        self.settings.save();
+                                    }
+                                }
                                 ui.label(
                                     egui::RichText::new(self.current_dir.file_name().unwrap_or_default().to_string_lossy())
                                         .small()
@@ -2105,9 +2327,24 @@ impl eframe::App for TypesafeApp {
                                     let btn = ui.add(egui::Button::new(text).frame(false)).on_hover_cursor(egui::CursorIcon::PointingHand);
 
                                     btn.context_menu(|ui| {
-                                        if !is_dir && ui.button("Set as Root File").clicked() {
-                                            self.root_file = Some(path.to_string_lossy().to_string());
-                                            ui.close_menu();
+                                        if !is_dir {
+                                            if ui.button("Set as Root File").clicked() {
+                                                self.root_file = Some(path.to_string_lossy().to_string());
+                                                ui.close_menu();
+                                            }
+                                            ui.separator();
+                                            if ui.button("🗑 Delete File").clicked() {
+                                                if rfd::MessageDialog::new()
+                                                    .set_title("Delete File")
+                                                    .set_description(&format!("Are you sure you want to delete {}?", name))
+                                                    .set_buttons(rfd::MessageButtons::YesNo)
+                                                    .show() == rfd::MessageDialogResult::Yes
+                                                {
+                                                    let _ = std::fs::remove_file(&path);
+                                                    ui.close_menu();
+                                                    ctx.request_repaint();
+                                                }
+                                            }
                                         }
                                     });
 
@@ -2150,8 +2387,8 @@ impl eframe::App for TypesafeApp {
                                 for node in nodes {
                                     ui.horizontal(|ui| {
                                         ui.add_space(node.level as f32 * 10.0);
-                                        let icon = if node.children.is_empty() {
-                                            "•"
+                                        let collapse_icon = if node.children.is_empty() {
+                                            " "
                                         } else if node.expanded {
                                             "▼"
                                         } else {
@@ -2159,12 +2396,22 @@ impl eframe::App for TypesafeApp {
                                         };
 
                                         if !node.children.is_empty() {
-                                            if ui.small_button(icon).clicked() {
+                                            if ui.small_button(collapse_icon).clicked() {
                                                 node.expanded = !node.expanded;
                                             }
                                         } else {
-                                            ui.label(icon);
+                                            ui.label(collapse_icon);
                                         }
+
+                                        let type_icon = match node.kind {
+                                            NodeKind::Section => "§",
+                                            NodeKind::Figure => "🖼",
+                                            NodeKind::Table => "▦",
+                                            NodeKind::Theorem => "T",
+                                            NodeKind::Citation => "❞",
+                                            NodeKind::Unknown => "•",
+                                        };
+                                        ui.label(egui::RichText::new(type_icon).color(egui::Color32::GRAY));
 
                                         if ui.button(egui::RichText::new(&node.label)).clicked() {
                                             *jump_action = Some((node.file_path.clone(), node.line));
@@ -2499,7 +2746,7 @@ impl eframe::App for TypesafeApp {
                 if self.show_log {
                     egui::ScrollArea::vertical()
                         .id_source("log_scroll")
-                        .max_height(200.0)
+                        .max_height(100.0)
                         .stick_to_bottom(true)
                         .show(ui, |ui| {
                             if !self.diagnostics.is_empty() {
@@ -2549,7 +2796,7 @@ impl eframe::App for TypesafeApp {
                         self.compile();
                     }
                     if ui.button("💾 Save (Ctrl+S)").clicked() {
-                        self.save_file();
+                        self.save_file(true);
                     }
                 });
             });
@@ -2738,6 +2985,42 @@ impl eframe::App for TypesafeApp {
             let theme_clone = theme;
             let editor_id = egui::Id::new("main_editor");
 
+            // Smart Indentation (Pre-process)
+            if ctx.memory(|m| m.has_focus(editor_id)) && ctx.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.is_none()) {
+                ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+
+                if let Some(mut state) = egui::TextEdit::load_state(ctx, editor_id) {
+                    if let Some(range) = state.cursor.char_range() {
+                        let idx = range.primary.index;
+
+                        // Identify indentation of current line
+                        let text_before = &self.editor_content[..idx];
+                        let line_start = text_before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+                        let current_line_prefix = &self.editor_content[line_start..idx];
+                        let indent: String = current_line_prefix.chars().take_while(|c| c.is_whitespace()).collect();
+
+                        let mut next_indent = indent.clone();
+
+                        // Check if we should increase indent
+                        let trimmed = current_line_prefix.trim_end();
+                        if trimmed.ends_with('{') || (trimmed.ends_with('}') && trimmed.contains("\\begin{")) {
+                            if !trimmed.contains("\\end{") {
+                                next_indent.push_str(INDENT_UNIT);
+                            }
+                        }
+
+                        let to_insert = format!("\n{}", next_indent);
+                        self.editor_content.insert_str(idx, &to_insert);
+                        text = self.editor_content.clone(); // Update local text for editor
+
+                        let new_cursor = idx + to_insert.len();
+                        state.cursor.set_char_range(Some(CCursorRange::one(CCursor::new(new_cursor))));
+                        state.store(ctx, editor_id);
+                        self.is_dirty = true;
+                    }
+                }
+            }
+
             // Handle SyncTeX (Ctrl+J)
             if ctx.input(|i| i.key_pressed(egui::Key::J) && i.modifiers.ctrl) {
                 if let Some(state) = egui::TextEdit::load_state(ctx, egui::Id::new("main_editor")) {
@@ -2764,9 +3047,9 @@ impl eframe::App for TypesafeApp {
                         self.completion_selected_index += 1;
                     }
                 }
-                if ctx.input(|i| i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Tab)) {
+                if ctx.input(|i| i.key_pressed(egui::Key::Tab) || (i.key_pressed(egui::Key::Enter) && i.modifiers.ctrl)) {
                     ctx.input_mut(|i| {
-                        i.consume_key(egui::Modifiers::NONE, egui::Key::Enter);
+                        i.consume_key(egui::Modifiers::CTRL, egui::Key::Enter);
                         i.consume_key(egui::Modifiers::NONE, egui::Key::Tab);
                     });
                     if let Some((completion, _)) = self.completion_suggestions.get(self.completion_selected_index) {
@@ -3080,6 +3363,7 @@ impl eframe::App for TypesafeApp {
 
                                 // Regex-based trigger for robustness (allows spaces like \ref { )
                                 let trigger_regex = regex::Regex::new(r"\\(ref|cite)\s*\{$").unwrap();
+                                let env_regex = regex::Regex::new(r"\\begin\{([a-zA-Z]*)$").unwrap();
 
                                 if let Some(cap) = trigger_regex.captures(text_slice) {
                                     let command = cap.get(1).unwrap().as_str();
@@ -3088,6 +3372,29 @@ impl eframe::App for TypesafeApp {
                                         self.completion_suggestions = self.labels.iter().map(|l| (l.clone(), "Label".to_string())).collect();
                                     } else {
                                         self.completion_suggestions = self.bib_items.iter().map(|b| (b.clone(), "Bib".to_string())).collect();
+                                    }
+                                } else if let Some(cap) = env_regex.captures(text_slice) {
+                                    let query = cap.get(1).unwrap().as_str();
+                                    self.completion_suggestions = self.latex_environments.iter()
+                                         .filter(|env| env.trigger.starts_with(query))
+                                         .map(|env| (env.completion.clone(), "Env".to_string()))
+                                         .collect();
+                                    if !self.completion_suggestions.is_empty() {
+                                        self.show_completions = true;
+                                    }
+                                } else if let Some(bs_idx) = text_slice.rfind('\\') {
+                                    let after_bs = &text_slice[bs_idx+1..];
+                                    // Check if it's a command being typed (no spaces, braces, etc)
+                                    if !after_bs.contains(|c: char| c.is_whitespace() || c == '{' || c == '[' || c == '}') && after_bs.chars().all(|c| c.is_alphabetic()) {
+                                         let query = after_bs;
+                                         self.completion_suggestions = self.latex_commands.iter()
+                                             .filter(|cmd| cmd.trigger.starts_with(&format!("\\{}", query)))
+                                             .map(|cmd| (cmd.completion.clone(), "Cmd".to_string()))
+                                             .collect();
+
+                                         if !self.completion_suggestions.is_empty() {
+                                             self.show_completions = true;
+                                         }
                                     }
                                 }
 
@@ -3106,8 +3413,10 @@ impl eframe::App for TypesafeApp {
 
 
 
-                    // Smart Indentation
-                    if response.has_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.is_none()) {
+
+
+                    // Disable old logic block (preserves file structure if block was larger)
+                    if false && response.has_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.is_none()) {
                         ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
 
                         if let Some(mut state) = egui::TextEdit::load_state(ctx, editor_id) {
@@ -3532,7 +3841,7 @@ impl eframe::App for TypesafeApp {
                                 if btn.clicked() || (is_selected && enter_pressed) {
                                     match *name {
                                         "Compile Project" => if !self.is_compiling { self.compile(); },
-                                        "Save File" => self.save_file(),
+                                        "Save File" => self.save_file(true),
                                         "Open File" => {
                                             if let Some(path) = rfd::FileDialog::new().add_filter("LaTeX", &["tex"]).pick_file() {
                                                 self.file_path = path.to_string_lossy().to_string();
