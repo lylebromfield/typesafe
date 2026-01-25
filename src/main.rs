@@ -19,6 +19,7 @@ use syntect::util::LinesWithEndings;
 use flate2::read::GzDecoder;
 use std::io::Read;
 use resvg::usvg::{TreeParsing, TreeTextToPath};
+use unicode_segmentation::UnicodeSegmentation;
 
 const INDENT_UNIT: &str = "    ";
 
@@ -1359,12 +1360,17 @@ impl TypesafeApp {
              return errors;
         }
 
-        let mut check_word = |start: usize, end: usize| {
-             let word = &text[start..end];
+        for (start, word) in text.unicode_word_indices() {
+             // Filter out non-alphabetic words
+             if !word.chars().any(|c| c.is_alphabetic()) {
+                 continue;
+             }
+
+             let end = start + word.len();
              let lower = word.to_lowercase();
 
              // Ignore LaTeX commands
-             if start > 0 && text[..start].ends_with('\\') { return; }
+             if start > 0 && text[..start].ends_with('\\') { continue; }
 
              // Ignore words in specific commands like \cite{...}, \usepackage{...}
              let preceding = &text[0..start];
@@ -1382,7 +1388,7 @@ impl TypesafeApp {
                      // Verify we haven't closed the brace yet
                      let after_brace = &preceding[brace_idx+1..];
                      if !after_brace.contains('}') {
-                         return;
+                         continue;
                      }
                  }
              }
@@ -1393,27 +1399,6 @@ impl TypesafeApp {
              {
                   errors.push(start..end);
              }
-        };
-
-        let mut in_word = false;
-        let mut start_idx = 0;
-
-        for (i, c) in text.char_indices() {
-            if c.is_alphabetic() {
-                if !in_word {
-                    in_word = true;
-                    start_idx = i;
-                }
-            } else {
-                if in_word {
-                    in_word = false;
-                    check_word(start_idx, i);
-                }
-            }
-        }
-
-        if in_word {
-            check_word(start_idx, text.len());
         }
 
         errors
@@ -3204,12 +3189,11 @@ impl eframe::App for TypesafeApp {
                              let tx = self.synonym_tx.clone();
                              let w = lower.clone();
                              std::thread::spawn(move || {
-                                  let url = format!("https://api.datamuse.com/words?rel_syn={}", w);
+                                  let url = format!("https://api.datamuse.com/words?ml={}&max=5", w);
                                   if let Ok(resp) = reqwest::blocking::get(&url) {
                                       if let Ok(json) = resp.json::<Vec<serde_json::Value>>() {
                                            let syns: Vec<String> = json.iter()
                                                .filter_map(|v| v["word"].as_str().map(|s| s.to_string()))
-                                               .take(5)
                                                .collect();
                                            let _ = tx.send((w, syns));
                                       }

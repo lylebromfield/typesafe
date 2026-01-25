@@ -4889,6 +4889,7 @@ dependencies = [
  "strsim",
  "syntect",
  "tiny-skia",
+ "unicode-segmentation",
  "winreg 0.52.0",
  "winres",
  "zip",

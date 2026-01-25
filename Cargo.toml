@@ -29,6 +29,7 @@ resvg = "0.36"
 tiny-skia = "0.11"
 winreg = "0.52"
 directories = "5.0"
+unicode-segmentation = "1.10"
 
 [build-dependencies]
 winres = "0.1"
