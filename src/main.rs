@@ -15,6 +15,8 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::{ThemeSet, Style};
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
+use flate2::read::GzDecoder;
+use std::io::Read;
 
 const INDENT_UNIT: &str = "    ";
 
@@ -430,11 +432,19 @@ struct TypesafeApp {
     context_menu_suggestions: Vec<String>,
     context_menu_replace_range: Option<std::ops::Range<usize>>,
     dictionary: std::collections::HashSet<String>,
+    user_dictionary: std::collections::HashSet<String>,
+    ignored_words: std::collections::HashSet<String>,
     synonym_cache: std::collections::HashMap<String, Vec<String>>,
     pending_synonyms: std::collections::HashSet<String>,
     synonym_rx: Receiver<(String, Vec<String>)>,
     synonym_tx: Sender<(String, Vec<String>)>,
     is_dirty: bool,
+
+    // Debounced Diagnostics
+    last_edit_time: f64,
+    checks_dirty: bool,
+    cached_syntax_errors: Vec<std::ops::Range<usize>>,
+    cached_spell_errors: Vec<std::ops::Range<usize>>,
 
     // Command Palette
     show_command_palette: bool,
@@ -462,6 +472,11 @@ struct TypesafeApp {
     magnifier_zoom: f32,
     #[allow(dead_code)]
     magnifier_size: f32,
+
+    // SyncTeX
+    page_sizes: std::collections::HashMap<usize, (f32, f32)>,
+    pending_scroll_target: Option<(usize, f32)>,
+    pending_cursor_scroll: Option<usize>,
 
     // Compilation
     compilation_log: String,
@@ -548,6 +563,17 @@ impl Default for TypesafeApp {
              });
         }
 
+        // Load User Dictionary
+        let mut user_dictionary = std::collections::HashSet::new();
+        let user_dict_path = std::path::Path::new("user_dictionary.txt");
+        if user_dict_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(user_dict_path) {
+                for line in content.lines() {
+                    user_dictionary.insert(line.trim().to_lowercase());
+                }
+            }
+        }
+
         Self {
             editor_content: default_content,
             file_path: default_file,
@@ -561,11 +587,17 @@ impl Default for TypesafeApp {
             context_menu_suggestions: Vec::new(),
             context_menu_replace_range: None,
             dictionary,
+            user_dictionary,
+            ignored_words: std::collections::HashSet::new(),
             synonym_cache: std::collections::HashMap::new(),
             pending_synonyms: std::collections::HashSet::new(),
             synonym_rx: syn_rx,
             synonym_tx: syn_tx,
             is_dirty: false,
+            last_edit_time: 0.0,
+            checks_dirty: true,
+            cached_syntax_errors: Vec::new(),
+            cached_spell_errors: Vec::new(),
             show_command_palette: false,
             cmd_query: String::new(),
             cmd_selected_index: 0,
@@ -594,6 +626,9 @@ impl Default for TypesafeApp {
             compile_tx: tx,
             pending_autocompile: true,
             diagnostics: Vec::new(),
+            page_sizes: std::collections::HashMap::new(),
+            pending_scroll_target: None,
+            pending_cursor_scroll: None,
             settings: Settings::default(),
             completion_suggestions: Vec::new(),
             show_completions: false,
@@ -709,6 +744,7 @@ impl TypesafeApp {
             page_idx,
             self.zoom,
             &mut self.preview_size,
+            &mut self.page_sizes,
         ) {
             Ok(texture) => {
                 self.pdf_textures.insert(page_idx, texture);
@@ -789,7 +825,9 @@ impl TypesafeApp {
 
             // Save current file content to disk
             let save_path = if file_path.is_empty() { "temp.tex".to_string() } else { file_path.clone() };
-            if let Err(e) = std::fs::write(&save_path, &content) {
+            // Strip BOM if present to prevent "Environment document undefined" errors
+            let clean_content = content.trim_start_matches('\u{feff}');
+            if let Err(e) = std::fs::write(&save_path, clean_content) {
                 let _ = tx.send(CompilationMsg::Error(format!("Write error: {}", e)));
                 return;
             }
@@ -798,12 +836,13 @@ impl TypesafeApp {
             let mut cmd = Command::new(&tectonic);
             // Determine output dir
             let parent_dir = std::path::Path::new(&target_path).parent().unwrap_or(std::path::Path::new("."));
+            let file_name = std::path::Path::new(&target_path).file_name().unwrap_or_default().to_string_lossy().to_string();
 
-            cmd.arg("-X")
+            cmd.current_dir(parent_dir)
+                .arg("-X")
                 .arg("compile")
-                .arg(&target_path)
-                .arg("-o")
-                .arg(parent_dir)
+                .arg("--synctex")
+                .arg(file_name)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
 
@@ -821,11 +860,21 @@ impl TypesafeApp {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 let mut diagnostics = Vec::new();
                 // Regex to find "l.123 context" pattern commonly output by TeX engines
-                let line_regex = regex::Regex::new(r"l\.(\d+)\s+(.*)").unwrap();
+                let tex_regex = regex::Regex::new(r"l\.(\d+)\s+(.*)").unwrap();
+                // Regex to find "error: file.tex:123: message" pattern output by Tectonic
+                let tectonic_regex = regex::Regex::new(r"error: .+:(\d+): (.*)").unwrap();
 
                 for line in stdout.lines().chain(stderr.lines()) {
-                    if let Some(caps) = line_regex.captures(line) {
+                    if let Some(caps) = tex_regex.captures(line) {
                         if let Ok(line_num) = caps[1].parse::<usize>() {
+                            diagnostics.push(Diagnostic {
+                                line: line_num,
+                                message: caps[2].to_string(),
+                                file: target_path.clone(),
+                            });
+                        }
+                    } else if let Some(caps) = tectonic_regex.captures(line) {
+                         if let Ok(line_num) = caps[1].parse::<usize>() {
                             diagnostics.push(Diagnostic {
                                 line: line_num,
                                 message: caps[2].to_string(),
@@ -1081,7 +1130,7 @@ impl TypesafeApp {
                      let word = &text[start_idx..i];
                      let lower = word.to_lowercase();
                      // Filter out LaTeX commands and check dictionary
-                     if !word.starts_with('\\') && !self.dictionary.contains(&lower) {
+                     if !word.starts_with('\\') && !self.dictionary.contains(&lower) && !self.user_dictionary.contains(&lower) && !self.ignored_words.contains(&lower) {
                          let is_command = start_idx > 0 && text[..start_idx].ends_with('\\');
                          if !is_command {
                             errors.push(start_idx..i);
@@ -1095,7 +1144,7 @@ impl TypesafeApp {
         if start_idx < text.len() {
              let word = &text[start_idx..];
              let lower = word.to_lowercase();
-             if !word.starts_with('\\') && !self.dictionary.contains(&lower) {
+             if !word.starts_with('\\') && !self.dictionary.contains(&lower) && !self.user_dictionary.contains(&lower) && !self.ignored_words.contains(&lower) {
                   let is_command = start_idx > 0 && text[..start_idx].ends_with('\\');
                   if !is_command {
                       errors.push(start_idx..text.len());
@@ -1192,7 +1241,82 @@ impl TypesafeApp {
             }
         }
         self.is_dirty = true;
+        self.checks_dirty = true;
+        self.last_edit_time = 0.0; // Force immediate check
         ctx.request_repaint();
+    }
+
+    fn sync_forward_search(&mut self, line_num: usize) {
+        let mut found = false;
+        if let Some(pdf_path) = &self.pdf_path {
+            let stem = pdf_path.file_stem().unwrap_or_default();
+            let parent = pdf_path.parent().unwrap_or(std::path::Path::new("."));
+            let synctex_path = parent.join(format!("{}.synctex.gz", stem.to_string_lossy()));
+
+            if synctex_path.exists() {
+                 if let Ok(file) = std::fs::File::open(&synctex_path) {
+                    let mut decoder = GzDecoder::new(file);
+                    let mut content = String::new();
+                    if decoder.read_to_string(&mut content).is_ok() {
+                        let file_name = std::path::Path::new(&self.file_path).file_name().unwrap_or_default().to_string_lossy();
+
+                        // 1. Find File ID
+                        let mut file_id = None;
+                        for line in content.lines() {
+                            if line.starts_with("Input:") {
+                                let parts: Vec<&str> = line.splitn(3, ':').collect();
+                                if parts.len() == 3 {
+                                    if parts[2].contains(&*file_name) {
+                                        file_id = parts[1].parse::<usize>().ok();
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        if let Some(fid) = file_id {
+                            let mut current_page = 1;
+                            let prefix = format!("{},{}:", fid, line_num);
+
+                            for line in content.lines() {
+                                if line.starts_with('{') {
+                                    if let Ok(p) = line[1..].parse::<usize>() { current_page = p; }
+                                } else if line.len() > 1 && line[1..].starts_with(&prefix) {
+                                     let parts: Vec<&str> = line.split(':').collect();
+                                     if parts.len() >= 2 {
+                                         let coords: Vec<&str> = parts[1].split(',').collect();
+                                         if coords.len() >= 2 {
+                                             if let Ok(v_sp) = coords[1].parse::<f32>() {
+                                                 let v_pt = v_sp / 65536.0;
+                                                 let page_idx = current_page.saturating_sub(1);
+
+                                                 let mut rel_y = 0.5;
+                                                 if let Some((_, h)) = self.page_sizes.get(&page_idx) {
+                                                     if *h > 0.0 { rel_y = v_pt / *h; }
+                                                 }
+                                                 self.current_page = page_idx;
+                                                 self.pending_scroll_target = Some((page_idx, rel_y));
+                                                 found = true;
+                                                 break;
+                                             }
+                                         }
+                                     }
+                                }
+                            }
+                        }
+                    }
+                 }
+            }
+        }
+
+        if !found {
+            // Naive fallback
+            let total_lines = self.editor_content.lines().count().max(1);
+            let rel = line_num as f32 / total_lines as f32;
+            let target_page = ((self.page_count as f32 * rel) as usize).min(self.page_count.saturating_sub(1));
+            self.current_page = target_page;
+            self.pending_scroll_target = Some((target_page, 0.5));
+        }
     }
 
     fn syntax_highlighting(&self, theme: &ThemeColors, text: &str) -> egui::text::LayoutJob {
@@ -1213,11 +1337,9 @@ impl TypesafeApp {
         let syntect_theme = &self.theme_set.themes[theme_name];
         let mut highlighter = HighlightLines::new(syntax, syntect_theme);
 
-        // Run syntax check
-        let errors = self.check_syntax(text);
-
-        // Run spell check
-        let spell_errors = self.check_spelling(text);
+        // Use cached errors to prevent flashing while typing
+        let errors = &self.cached_syntax_errors;
+        let spell_errors = &self.cached_spell_errors;
 
         // Run search check
         let mut search_matches_bytes = Vec::new();
@@ -1242,11 +1364,14 @@ impl TypesafeApp {
 
         let mut job = egui::text::LayoutJob::default();
         let mut current_byte_idx = 0;
+        let mut line_num = 1;
 
         for line in LinesWithEndings::from(text) {
             let ranges: Vec<(Style, &str)> = highlighter
                 .highlight_line(line, &self.syntax_set)
                 .unwrap_or_default();
+
+            let has_compiler_error = self.diagnostics.iter().any(|d| d.line == line_num);
 
             for (style, range_text) in ranges {
                 let range_len = range_text.len();
@@ -1260,7 +1385,7 @@ impl TypesafeApp {
                 // Split tokens to precisely highlight errors and search matches
                 let mut split_points = vec![0, range_len];
 
-                for e in &errors {
+                for e in errors {
                     if e.start > range_start && e.start < range_end {
                         split_points.push(e.start - range_start);
                     }
@@ -1269,7 +1394,7 @@ impl TypesafeApp {
                     }
                 }
 
-                for e in &spell_errors {
+                for e in spell_errors {
                     if e.start > range_start && e.start < range_end {
                         split_points.push(e.start - range_start);
                     }
@@ -1305,6 +1430,8 @@ impl TypesafeApp {
 
                     let stroke = if has_error {
                         Stroke::new(2.0, theme.error)
+                    } else if has_compiler_error {
+                        Stroke::new(1.5, theme.error)
                     } else if is_spell_error {
                         Stroke::new(1.0, theme.warning)
                     } else {
@@ -1332,6 +1459,7 @@ impl TypesafeApp {
 
                 current_byte_idx += range_len;
             }
+            line_num += 1;
         }
 
         job
@@ -1389,36 +1517,7 @@ impl eframe::App for TypesafeApp {
             }
         }
 
-        if self.show_log {
-            egui::Window::new("Compilation Log & Diagnostics")
-                .open(&mut self.show_log)
-                .resizable(true)
-                .default_height(200.0)
-                .show(ctx, |ui| {
-                    if !self.diagnostics.is_empty() {
-                         ui.label(egui::RichText::new("Diagnostics:").strong().color(egui::Color32::from_rgb(255, 100, 100)));
-                         egui::ScrollArea::vertical().max_height(100.0).id_source("diag_scroll").show(ui, |ui| {
-                             for diag in &self.diagnostics {
-                                 if ui.link(format!("Line {}: {}", diag.line, diag.message)).clicked() {
-                                     // Calculate char index for line
-                                     let char_idx = self.editor_content.lines().take(diag.line.saturating_sub(1)).map(|l| l.len() + 1).sum::<usize>();
 
-                                     if let Some(mut state) = egui::TextEdit::load_state(ctx, egui::Id::new("main_editor")) {
-                                          state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(char_idx))));
-                                          state.store(ctx, egui::Id::new("main_editor"));
-                                     }
-                                 }
-                             }
-                         });
-                         ui.separator();
-                    }
-
-                    ui.label("Raw Log:");
-                    egui::ScrollArea::vertical().id_source("log_scroll").show(ui, |ui| {
-                        ui.add(egui::TextEdit::multiline(&mut self.compilation_log.as_str()).code_editor());
-                    });
-                });
-        }
 
         // Handle keyboard shortcuts
         if ctx.input(|i| {
@@ -1991,22 +2090,123 @@ impl eframe::App for TypesafeApp {
                                             Vec2::new(display_width, display_height),
                                         )).sense(egui::Sense::click()));
 
+                                        if let Some((p, rel_y)) = self.pending_scroll_target {
+                                            if p == page_idx {
+                                                let y_pos = img_resp.rect.min.y + img_resp.rect.height() * rel_y;
+                                                let target_rect = egui::Rect::from_min_size(
+                                                    egui::pos2(img_resp.rect.min.x, y_pos),
+                                                    egui::vec2(img_resp.rect.width(), 1.0)
+                                                );
+                                                ui.scroll_to_rect(target_rect, Some(egui::Align::Center));
+                                                self.pending_scroll_target = None;
+                                            }
+                                        }
 
                                         if self.page_count > 0 {
                                             if img_resp.double_clicked() {
-                                                let total_lines = self.editor_content.lines().count().max(1);
-                                                let rel_in_page = if let Some(pos) = img_resp.interact_pointer_pos() {
-                                                    ((pos.y - img_resp.rect.min.y) / img_resp.rect.height().max(1.0)).clamp(0.0, 1.0)
-                                                } else {
-                                                    0.5
-                                                };
-                                                let rel = (page_idx as f32 + rel_in_page) / (self.page_count as f32);
-                                                let target_line = ((rel * total_lines as f32).round() as usize).min(total_lines.saturating_sub(1));
-                                                if let Some(mut state) = egui::TextEdit::load_state(ctx, egui::Id::new("main_editor")) {
-                                                    let char_idx = self.editor_content.lines().take(target_line).map(|l| l.len() + 1).sum::<usize>();
-                                                    let line_len = self.editor_content.lines().nth(target_line).map(|l| l.len()).unwrap_or(0);
-                                                    state.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(char_idx), egui::text::CCursor::new(char_idx + line_len))));
-                                                    state.store(ctx, egui::Id::new("main_editor"));
+                                                let mut jumped = false;
+
+                                                // Try SyncTeX inverse search
+                                                if let Some(pos) = img_resp.interact_pointer_pos() {
+                                                    if let Some((_, page_h)) = self.page_sizes.get(&page_idx) {
+                                                        let rel_y = (pos.y - img_resp.rect.min.y) / img_resp.rect.height();
+                                                        let y_pt = rel_y * page_h;
+
+                                                        if let Some(pdf_path) = &self.pdf_path {
+                                                            let stem = pdf_path.file_stem().unwrap_or_default();
+                                                            let parent = pdf_path.parent().unwrap_or(std::path::Path::new("."));
+                                                            let synctex_path = parent.join(format!("{}.synctex.gz", stem.to_string_lossy()));
+
+                                                            if synctex_path.exists() {
+                                                                if let Ok(file) = std::fs::File::open(&synctex_path) {
+                                                                    let mut decoder = GzDecoder::new(file);
+                                                                    let mut content = String::new();
+                                                                    if decoder.read_to_string(&mut content).is_ok() {
+                                                                        // Manual Inverse Search
+                                                                        let target_page = page_idx + 1;
+                                                                        let mut current_page = 0;
+                                                                        let mut best_dist = f32::MAX;
+                                                                        let mut best_line = 0;
+                                                                        let target_y_sp = y_pt * 65536.0;
+
+                                                                        for line in content.lines() {
+                                                                            if line.starts_with('{') {
+                                                                                if let Ok(p) = line[1..].parse::<usize>() { current_page = p; }
+                                                                            } else if current_page == target_page {
+                                                                                let first = line.chars().next().unwrap_or(' ');
+                                                                                if "xkgvh".contains(first) {
+                                                                                    if let Some(colon) = line.find(':') {
+                                                                                        let parts: Vec<&str> = line[1..colon].split(',').collect();
+                                                                                        if parts.len() >= 2 {
+                                                                                            if let Ok(rec_line) = parts[1].parse::<usize>() {
+                                                                                                let coords: Vec<&str> = line[colon+1..].split(',').collect();
+                                                                                                if coords.len() >= 2 {
+                                                                                                    if let Ok(v_sp) = coords[1].parse::<f32>() {
+                                                                                                        let dist = (v_sp - target_y_sp).abs();
+                                                                                                        if dist < best_dist && dist < 65536.0 * 50.0 { // Increased tolerance
+                                                                                                            best_dist = dist;
+                                                                                                            best_line = rec_line;
+                                                                                                        }
+                                                                                                    }
+                                                                                                }
+                                                                                            }
+                                                                                        }
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                        }
+
+                                                                        if best_line > 0 {
+                                                                            let line = best_line - 1;
+                                                                            // Calculate accurate char index (handling UTF-8 and mixed newlines)
+                                                                            let char_idx = if line == 0 { 0 } else {
+                                                                                self.editor_content.chars()
+                                                                                    .enumerate()
+                                                                                    .filter(|&(_, c)| c == '\n')
+                                                                                    .nth(line - 1)
+                                                                                    .map(|(i, _)| i + 1)
+                                                                                    .unwrap_or(0)
+                                                                            };
+
+                                                                            if let Some(mut state) = egui::TextEdit::load_state(ctx, egui::Id::new("main_editor")) {
+                                                                                 // Calculate line length for selection
+                                                                                 let line_len = self.editor_content.chars().skip(char_idx).take_while(|&c| c != '\n').count();
+
+                                                                                 state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                                                                                     egui::text::CCursor::new(char_idx),
+                                                                                     egui::text::CCursor::new(char_idx + line_len)
+                                                                                 )));
+                                                                                 state.store(ctx, egui::Id::new("main_editor"));
+
+                                                                                 // Force focus to editor so it scrolls and shows cursor
+                                                                                 ctx.memory_mut(|m| m.request_focus(egui::Id::new("main_editor")));
+                                                                                 self.pending_cursor_scroll = Some(char_idx);
+                                                                                 jumped = true;
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+
+                                                // Fallback to naive estimation
+                                                if !jumped {
+                                                    let total_lines = self.editor_content.lines().count().max(1);
+                                                    let rel_in_page = if let Some(pos) = img_resp.interact_pointer_pos() {
+                                                        ((pos.y - img_resp.rect.min.y) / img_resp.rect.height().max(1.0)).clamp(0.0, 1.0)
+                                                    } else {
+                                                        0.5
+                                                    };
+                                                    let rel = (page_idx as f32 + rel_in_page) / (self.page_count as f32);
+                                                    let target_line = ((rel * total_lines as f32).round() as usize).min(total_lines.saturating_sub(1));
+                                                    if let Some(mut state) = egui::TextEdit::load_state(ctx, egui::Id::new("main_editor")) {
+                                                        let char_idx = self.editor_content.lines().take(target_line).map(|l| l.len() + 1).sum::<usize>();
+                                                        let line_len = self.editor_content.lines().nth(target_line).map(|l| l.len()).unwrap_or(0);
+                                                        state.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(char_idx), egui::text::CCursor::new(char_idx + line_len))));
+                                                        state.store(ctx, egui::Id::new("main_editor"));
+                                                    }
                                                 }
                                             }
                                         }
@@ -2062,9 +2262,22 @@ impl eframe::App for TypesafeApp {
                 if self.show_log {
                     egui::ScrollArea::vertical()
                         .id_source("log_scroll")
-                        .max_height(160.0)
+                        .max_height(200.0)
                         .stick_to_bottom(true)
                         .show(ui, |ui| {
+                            if !self.diagnostics.is_empty() {
+                                 ui.label(egui::RichText::new("Diagnostics (Click to Jump):").strong().color(egui::Color32::from_rgb(255, 100, 100)));
+                                 for diag in &self.diagnostics {
+                                     if ui.link(format!("Line {}: {}", diag.line, diag.message)).clicked() {
+                                         let char_idx = self.editor_content.lines().take(diag.line.saturating_sub(1)).map(|l| l.len() + 1).sum::<usize>();
+                                         if let Some(mut state) = egui::TextEdit::load_state(ctx, egui::Id::new("main_editor")) {
+                                              state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(char_idx))));
+                                              state.store(ctx, egui::Id::new("main_editor"));
+                                         }
+                                     }
+                                 }
+                                 ui.separator();
+                            }
                             ui.add(
                                 egui::TextEdit::multiline(&mut self.compilation_log)
                                     .font(TextStyle::Monospace)
@@ -2074,6 +2287,16 @@ impl eframe::App for TypesafeApp {
                         });
                 }
             });
+
+        // Run debounced checks
+        let now = ctx.input(|i| i.time);
+        if self.checks_dirty && now - self.last_edit_time > 0.5 {
+            self.cached_syntax_errors = self.check_syntax(&self.editor_content);
+            self.cached_spell_errors = self.check_spelling(&self.editor_content);
+            self.checks_dirty = false;
+        } else if self.checks_dirty {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
 
         // ====== CENTRAL PANEL (EDITOR) ======
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -2271,6 +2494,18 @@ impl eframe::App for TypesafeApp {
             let theme_clone = theme;
             let editor_id = egui::Id::new("main_editor");
 
+            // Handle SyncTeX (Ctrl+J)
+            if ctx.input(|i| i.key_pressed(egui::Key::J) && i.modifiers.ctrl) {
+                if let Some(state) = egui::TextEdit::load_state(ctx, egui::Id::new("main_editor")) {
+                    if let Some(range) = state.cursor.char_range() {
+                        let idx = range.primary.index;
+                        let line_num = self.editor_content[..idx].chars().filter(|&c| c == '\n').count() + 1;
+
+                        self.sync_forward_search(line_num);
+                    }
+                }
+            }
+
             // Handle Navigation
             if self.show_completions && !self.completion_suggestions.is_empty() {
                 if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
@@ -2306,6 +2541,7 @@ impl eframe::App for TypesafeApp {
             egui::ScrollArea::vertical()
                 .id_source("editor_scroll")
                 .show(ui, |ui| {
+                    let scroll_target = self.pending_cursor_scroll;
                     let mut layouter = |ui: &egui::Ui, string: &str, wrap_width: f32| {
                         let mut layout_job = self.syntax_highlighting(&theme_clone, string);
                         layout_job.wrap.max_width = wrap_width;
@@ -2315,14 +2551,23 @@ impl eframe::App for TypesafeApp {
                     let output = egui::Frame::none()
                         .inner_margin(egui::Margin { left: gutter_width, ..Default::default() })
                         .show(ui, |ui| {
-                            egui::TextEdit::multiline(&mut text)
+                            let out = egui::TextEdit::multiline(&mut text)
                                 .id(editor_id)
                                 .font(TextStyle::Monospace)
                                 .desired_width(f32::INFINITY)
                                 .code_editor()
                                 .lock_focus(true)
                                 .layouter(&mut layouter)
-                                .show(ui)
+                                .show(ui);
+
+                            if let Some(idx) = scroll_target {
+                                let ccursor = egui::text::CCursor::new(idx);
+                                let cursor = out.galley.from_ccursor(ccursor);
+                                let rect = out.galley.pos_from_cursor(&cursor);
+                                let target = egui::Rect::from_min_size(out.response.rect.min + rect.min.to_vec2(), egui::Vec2::ZERO);
+                                ui.scroll_to_rect(target, Some(egui::Align::Center));
+                            }
+                            out
                         });
 
                     let response = output.inner.response;
@@ -2360,7 +2605,12 @@ impl eframe::App for TypesafeApp {
                                         // Populate spelling suggestions
                                         let lower = word.to_lowercase();
                                         let mut suggestions = Vec::new();
-                                        if !self.dictionary.is_empty() && !self.dictionary.contains(&lower) {
+                                        let is_misspelled = !self.dictionary.is_empty()
+                                            && !self.dictionary.contains(&lower)
+                                            && !self.user_dictionary.contains(&lower)
+                                            && !self.ignored_words.contains(&lower);
+
+                                        if is_misspelled {
                                             let target_len = lower.len();
                                             for valid_word in &self.dictionary {
                                                 if valid_word.len().abs_diff(target_len) <= 2 {
@@ -2402,8 +2652,9 @@ impl eframe::App for TypesafeApp {
                                            let _ = tx.send((w, syns));
                                       }
                                   }
-                             });
-                        }
+                              });
+                          self.pending_cursor_scroll = None;
+                      }
                     }
 
                     let selected_word = self.context_menu_word.clone();
@@ -2417,13 +2668,54 @@ impl eframe::App for TypesafeApp {
                             ui.separator();
 
                             if selected_suggestions.is_empty() {
-                                ui.label(egui::RichText::new("No spelling suggestions").italics());
+                                // Only check if it's actually considered misspelled by our logic
+                                let lower = word.to_lowercase();
+                                let is_misspelled = !self.dictionary.is_empty()
+                                    && !self.dictionary.contains(&lower)
+                                    && !self.user_dictionary.contains(&lower)
+                                    && !self.ignored_words.contains(&lower);
+
+                                if is_misspelled {
+                                    ui.label(egui::RichText::new("No spelling suggestions").italics());
+                                }
                             } else {
                                 for suggestion in &selected_suggestions {
                                     if ui.button(format!("Fix: {}", suggestion)).clicked() {
                                         replacement = Some(suggestion.clone());
                                         ui.close_menu();
                                     }
+                                }
+                            }
+
+                            ui.separator();
+                            if ui.button("Go to PDF").clicked() {
+                                if let Some(range) = &selected_range {
+                                    let start_byte = range.start;
+                                    let line_num = self.editor_content[..start_byte].chars().filter(|&c| c == '\n').count() + 1;
+
+                                    self.sync_forward_search(line_num);
+                                }
+                                ui.close_menu();
+                            }
+
+                            // Dictionary Actions
+                            let lower = word.to_lowercase();
+                            let is_known = self.dictionary.contains(&lower) || self.user_dictionary.contains(&lower) || self.ignored_words.contains(&lower);
+
+                            if !is_known {
+                                ui.separator();
+                                if ui.button("➕ Add to Dictionary").clicked() {
+                                    self.user_dictionary.insert(lower.clone());
+                                    // Append to file
+                                    use std::io::Write;
+                                    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("user_dictionary.txt") {
+                                        let _ = writeln!(file, "{}", lower);
+                                    }
+                                    ui.close_menu();
+                                }
+                                if ui.button("🚫 Ignore Word").clicked() {
+                                    self.ignored_words.insert(lower.clone());
+                                    ui.close_menu();
                                 }
                             }
 
@@ -2495,6 +2787,8 @@ impl eframe::App for TypesafeApp {
                     if response.changed() {
                         self.editor_content = text.clone();
                         self.is_dirty = true;
+                        self.last_edit_time = ctx.input(|i| i.time);
+                        self.checks_dirty = true;
 
                         // Autocomplete Trigger
                         if let Some(state) = egui::TextEdit::load_state(ctx, editor_id) {
@@ -2526,32 +2820,7 @@ impl eframe::App for TypesafeApp {
                         }
                     }
 
-                    if self.show_completions && !self.completion_suggestions.is_empty() {
-                         let pos = self.completion_popup_pos;
-                         egui::Area::new(egui::Id::new("completion_popup"))
-                             .fixed_pos(pos)
-                             .order(egui::Order::Foreground)
-                             .show(ctx, |ui| {
-                                 egui::Frame::popup(ui.style()).show(ui, |ui| {
-                                     ui.set_max_width(300.0);
-                                     ui.set_max_height(200.0);
-                                     egui::ScrollArea::vertical().show(ui, |ui| {
-                                         let suggestions = self.completion_suggestions.clone();
-                                         for (i, (suggestion, kind)) in suggestions.iter().enumerate() {
-                                             let selected = i == self.completion_selected_index;
-                                             let label = format!("{} ({})", suggestion, kind);
-                                             if ui.selectable_label(selected, label).clicked() {
-                                                 self.completion_selected_index = i;
-                                                 let completion = suggestion.clone();
-                                                 self.apply_completion(ctx, &mut text, &completion);
-                                                 self.show_completions = false;
-                                                 self.editor_content = text.clone();
-                                             }
-                                         }
-                                     });
-                                 });
-                             });
-                    }
+
 
                     // Smart Indentation
                     if response.has_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.is_none()) {
@@ -2699,6 +2968,16 @@ impl eframe::App for TypesafeApp {
                         ("\\footnote{", "\\footnote{}"),
                         ("\\maketitle", "\\maketitle"),
                         ("\\tableofcontents", "\\tableofcontents"),
+                        ("\\newpage", "\\newpage"),
+                        ("\\begin{document}", "\\begin{document}"),
+                        ("\\end{document}", "\\end{document}"),
+                        ("\\begin{itemize}", "\\begin{itemize}\n    \\item \n\\end{itemize}"),
+                        ("\\begin{enumerate}", "\\begin{enumerate}\n    \\item \n\\end{enumerate}"),
+                        ("\\begin{figure}", "\\begin{figure}[h]\n    \\centering\n    \\caption{}\n\\end{figure}"),
+                        ("\\usepackage{", "\\usepackage{}"),
+                        ("\\documentclass{", "\\documentclass{}"),
+                        ("\\include{", "\\include{}"),
+                        ("\\input{", "\\input{}"),
                     ];
 
                     // Handle Tab key
@@ -3030,25 +3309,47 @@ fn ensure_fontconfig() {
 "#;
             let _ = std::fs::write(fonts_conf_path, fonts_conf_content);
         }
-        std::env::set_var("FONTCONFIG_FILE", fonts_conf_path);
-        let config_dir = std::path::Path::new(fonts_conf_path).parent().unwrap_or(std::path::Path::new("."));
+
+        let abs_path = if std::path::Path::new(fonts_conf_path).is_absolute() {
+            std::path::PathBuf::from(fonts_conf_path)
+        } else {
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")).join(fonts_conf_path)
+        };
+        std::env::set_var("FONTCONFIG_FILE", &abs_path);
+        let config_dir = abs_path.parent().unwrap_or(std::path::Path::new("."));
         std::env::set_var("FONTCONFIG_PATH", config_dir);
     }
 }
 
 fn locate_tectonic() -> String {
-    let exe = if cfg!(windows) { "tectonic.exe" } else { "tectonic" };
+    let exe_name = if cfg!(windows) { "tectonic.exe" } else { "tectonic" };
 
-    if std::path::Path::new(exe).exists() {
-        exe.to_string()
-    } else {
-        let deps_exe = format!("deps/{}", exe);
-        if std::path::Path::new(&deps_exe).exists() {
-            deps_exe
-        } else {
-            "tectonic".to_string()
+    // 1. Check next to the executable (Deployment / Standalone)
+    if let Ok(current_exe) = std::env::current_exe() {
+        if let Some(parent) = current_exe.parent() {
+            let candidate = parent.join(exe_name);
+            if candidate.exists() {
+                return candidate.to_string_lossy().into_owned();
+            }
+            // Check deps folder relative to executable
+            let candidate_deps = parent.join("deps").join(exe_name);
+            if candidate_deps.exists() {
+                 return candidate_deps.to_string_lossy().into_owned();
+            }
         }
     }
+
+    // 2. Check CWD (Development / mixed)
+    if std::path::Path::new(exe_name).exists() {
+        return exe_name.to_string();
+    }
+    let deps_exe = std::path::Path::new("deps").join(exe_name);
+    if deps_exe.exists() {
+        return deps_exe.to_string_lossy().into_owned();
+    }
+
+    // 3. Fallback to PATH
+    exe_name.to_string()
 }
 
 fn render_pdf_page_to_texture(
@@ -3058,11 +3359,16 @@ fn render_pdf_page_to_texture(
     page_index: usize,
     zoom: f32,
     preview_size: &mut Option<[usize; 2]>,
+    page_sizes: &mut std::collections::HashMap<usize, (f32, f32)>,
 ) -> Result<egui::TextureHandle, Box<dyn std::error::Error>> {
     let doc = pdfium.load_pdf_from_file(pdf_path, None)?;
 
     let page_index_u16: u16 = page_index.try_into()?;
     let page = doc.pages().get(page_index_u16)?;
+
+    let width_pt = page.width().value;
+    let height_pt = page.height().value;
+    page_sizes.insert(page_index, (width_pt, height_pt));
 
     let target_width = (1400.0 * zoom).round() as i32;
     let render_config = PdfRenderConfig::new()

@@ -4640,6 +4640,7 @@ dependencies = [
  "egui",
  "env_logger",
  "epaint",
+ "flate2",
  "image 0.25.9",
  "log",
  "pdfium-render",

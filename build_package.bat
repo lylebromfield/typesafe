@@ -4,7 +4,7 @@ setlocal
 REM Ensure we are in the project root (where this script resides)
 cd /d "%~dp0"
 
-echo [INFO] Starting clean build...
+echo [INFO] Starting build...
 
 REM ------------------------------------------------------------------
 REM Build Release
@@ -29,20 +29,43 @@ copy /y "target\release\typesafe.exe" ".\typesafe.exe" >nul
 
 REM Copy PDFium if present (needed for runtime)
 if exist "deps\pdfium.dll" (
-    copy /y "deps\pdfium.dll" ".\pdfium.dll" >nul
+    echo [INFO] Copying pdfium.dll to root...
+    copy /y "deps\pdfium.dll" ".\pdfium.dll"
 )
 
-REM Copy Tectonic if present (needed for runtime)
+REM Copy executable to root
+echo [INFO] Copying typesafe.exe to root...
+copy /y "target\release\typesafe.exe" ".\typesafe.exe"
+
+REM Copy Tectonic and Pdfium to target/release for standalone running
+echo [INFO] Populating target/release...
 if exist "deps\tectonic.exe" (
-    copy /y "deps\tectonic.exe" ".\tectonic.exe" >nul
+    echo Copying tectonic.exe to target/release...
+    copy /y "deps\tectonic.exe" "target\release\"
+)
+if exist "deps\pdfium.dll" (
+    echo Copying pdfium.dll to target/release...
+    copy /y "deps\pdfium.dll" "target\release\"
+)
+if exist "icon.png" (
+    echo Copying icon.png to target/release...
+    copy /y "icon.png" "target\release\"
+)
+if exist "dictionary.txt" (
+    echo Copying dictionary.txt to target/release...
+    copy /y "dictionary.txt" "target\release\"
 )
 
-REM ------------------------------------------------------------------
-REM Cleanup
-REM ------------------------------------------------------------------
-echo [INFO] Cleaning up build artifacts...
-if exist "target" rmdir /s /q "target"
-if exist "dist" rmdir /s /q "dist"
+REM Copy dependencies to root for running from root
+echo [INFO] Populating root...
+if exist "deps\tectonic.exe" (
+    echo Copying tectonic.exe to root...
+    copy /y "deps\tectonic.exe" ".\tectonic.exe"
+)
+if exist "deps\pdfium.dll" (
+    echo Copying pdfium.dll to root...
+    copy /y "deps\pdfium.dll" ".\pdfium.dll"
+)
 
-echo [SUCCESS] Build complete. typesafe.exe is ready in the project root.
+echo [SUCCESS] Build complete. Executable available in project root and target/release.
 endlocal

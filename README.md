@@ -21,7 +21,7 @@ To build Typesafe, you need to have **Rust** and **Cargo** installed.
 1.  **Install Rust**: Visit [rustup.rs](https://rustup.rs/) to install.
 2.  **Clone the Repository**:
     ```bash
-    git clone https://github.com/lylebromfield/typesafe.git
+    git clone https://github.com/yourusername/typesafe.git
     cd typesafe
     ```
 3.  **Build**:
@@ -31,7 +31,7 @@ To build Typesafe, you need to have **Rust** and **Cargo** installed.
     ```cmd
     build_package.bat
     ```
-    This script builds the release binary, copies `tectonic.exe` and `pdfium.dll` from the `deps/` folder (if present), and places everything in the root directory.
+    This script performs an **incremental build** (preserving build artifacts in `target/` for faster re-compilation), copies `tectonic.exe` and `pdfium.dll` from the `deps/` folder (if present), and places the final `typesafe.exe` in the root directory.
 
     **Option B: Manual Build**
     ```bash
@@ -51,8 +51,9 @@ Typesafe requires two external binaries to function correctly. These should be p
     - Linux: `libpdfium.so`
     - macOS: `libpdfium.dylib`
 
-*Note: The project includes a helper script `build_package.bat` that attempts to organize these files for you on Windows.*
+*Note: The `build_package.bat` script handles copying these files automatically if they are present in the `deps/` folder.*
 
 ## Customization
 
+- **App Icon**: Place a 256x256 PNG file named `icon.png` in the project root to set the window icon.
 - **Dictionary**: The app downloads `dictionary.txt` from GitHub on the first launch. You can manually replace this file with any newline-separated word list to change the spell check dictionary.
