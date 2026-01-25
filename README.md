@@ -21,7 +21,7 @@ To build Typesafe, you need to have **Rust** and **Cargo** installed.
 1.  **Install Rust**: Visit [rustup.rs](https://rustup.rs/) to install.
 2.  **Clone the Repository**:
     ```bash
-    git clone https://github.com/yourusername/typesafe.git
+    git clone https://github.com/lylebromfield/typesafe.git
     cd typesafe
     ```
 3.  **Build**:
