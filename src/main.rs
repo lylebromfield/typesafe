@@ -505,6 +505,8 @@ struct TypesafeApp {
     current_dir: std::path::PathBuf,
     root_file: Option<String>,
     show_file_panel: bool,
+    show_preview_panel: bool,
+    last_window_width: f32,
     outline_nodes: Vec<StructureNode>,
     labels: Vec<String>,
     bib_items: Vec<String>,
@@ -798,6 +800,8 @@ impl Default for TypesafeApp {
             current_dir,
             root_file: None,
             show_file_panel: true,
+            show_preview_panel: true,
+            last_window_width: 1200.0,
             outline_nodes: Vec::new(),
             labels: Vec::new(),
             bib_items: Vec::new(),
@@ -1894,6 +1898,39 @@ impl eframe::App for TypesafeApp {
         theme.accent = self.settings.accent.color();
         Self::apply_theme(ctx, theme);
 
+        // Responsive Layout Logic
+        let window_width = ctx.screen_rect().width();
+        if (window_width - self.last_window_width).abs() > 2.0 {
+             // If shrinking
+             if window_width < self.last_window_width {
+                 let files_allowance = if self.show_file_panel { 250.0 } else { 32.0 };
+                 let preview_allowance = if self.show_preview_panel { 350.0 } else { 32.0 };
+                 let min_editor_width = 720.0;
+
+                 let remaining = window_width - files_allowance - preview_allowance;
+
+                 // Force PDF to re-fit width when window shrinks to prevent cutoff
+                 if self.show_preview_panel {
+                     self.fit_mode = PdfFitMode::FitWidth;
+                     self.pdf_textures.clear();
+                 }
+
+                 if remaining < min_editor_width {
+                     if self.show_file_panel {
+                         self.show_file_panel = false;
+                         // If closing files isn't enough, also close preview
+                         let new_remaining = window_width - 32.0 - preview_allowance;
+                         if new_remaining < min_editor_width && self.show_preview_panel {
+                             self.show_preview_panel = false;
+                         }
+                     } else if self.show_preview_panel {
+                         self.show_preview_panel = false;
+                     }
+                 }
+             }
+             self.last_window_width = window_width;
+        }
+
         // Poll synonym results
         while let Ok((word, synonyms)) = self.synonym_rx.try_recv() {
             self.synonym_cache.insert(word, synonyms);
@@ -2399,11 +2436,16 @@ impl eframe::App for TypesafeApp {
                 .default_width(200.0)
                 .show(ctx, |ui| {
                     ui.add_space(8.0);
-                    ui.label(
-                        egui::RichText::new("📂 FILES")
-                            .color(theme.text_secondary)
-                            .strong(),
-                    );
+                    ui.horizontal(|ui| {
+                        if ui.add(egui::Button::new("📂").frame(false)).on_hover_text("Collapse").clicked() {
+                            self.show_file_panel = false;
+                        }
+                        ui.label(
+                            egui::RichText::new("FILES")
+                                .color(theme.text_secondary)
+                                .strong(),
+                        );
+                    });
                     ui.separator();
 
                     let height = ui.available_height();
@@ -2627,26 +2669,49 @@ impl eframe::App for TypesafeApp {
                         });
                     });
                 });
+        } else {
+            egui::SidePanel::left("files_panel_slim")
+                .resizable(false)
+                .exact_width(32.0)
+                .show(ctx, |ui| {
+                    ui.add_space(8.0);
+                    ui.vertical_centered(|ui| {
+                        if ui.button("📂").on_hover_text("Expand Files").clicked() {
+                            self.show_file_panel = true;
+                        }
+                    });
+                });
         }
 
         // ====== RIGHT PANEL (PREVIEW) ======
+        if self.show_preview_panel {
+        let files_gap = if self.show_file_panel { 250.0 } else { 40.0 };
+        let min_editor_width = 720.0;
+        let max_preview_w = (ctx.screen_rect().width() - files_gap - min_editor_width).max(300.0);
+
         egui::SidePanel::right("preview_panel")
             .resizable(true)
             .default_width(600.0)
             .min_width(300.0)
+            .max_width(max_preview_w)
             .show(ctx, |ui| {
                 ui.add_space(8.0);
-                ui.label(
-                    egui::RichText::new("📄 PREVIEW")
-                        .color(theme.text_secondary)
-                        .strong(),
-                );
+                ui.horizontal(|ui| {
+                     if ui.add(egui::Button::new("📄").frame(false)).on_hover_text("Collapse").clicked() {
+                         self.show_preview_panel = false;
+                     }
+                     ui.label(
+                        egui::RichText::new("PREVIEW")
+                            .color(theme.text_secondary)
+                            .strong(),
+                    );
+                });
                 ui.separator();
 
 
 
                 // Preview Controls
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
 
                     // Page Navigation
@@ -2671,16 +2736,21 @@ impl eframe::App for TypesafeApp {
                     // Zoom Controls
                     let mut zoom = self.zoom;
                     if ui.button("➖").clicked() {
-                        zoom = (zoom - 0.1).clamp(0.5, 3.0);
+                        zoom = (zoom - 0.1).clamp(0.1, 5.0);
+                        self.fit_mode = PdfFitMode::Normal;
                     }
-                    ui.add(egui::Slider::new(&mut zoom, 0.5..=3.0).step_by(0.05).show_value(false));
+                    if ui.add(egui::Slider::new(&mut zoom, 0.1..=5.0).step_by(0.05).show_value(false)).changed() {
+                        self.fit_mode = PdfFitMode::Normal;
+                    }
                     if ui.button("➕").clicked() {
-                        zoom = (zoom + 0.1).clamp(0.5, 3.0);
+                        zoom = (zoom + 0.1).clamp(0.1, 5.0);
+                        self.fit_mode = PdfFitMode::Normal;
                     }
 
                     let mut zoom_percent = (zoom * 100.0).round() as u32;
                     if ui.add(egui::DragValue::new(&mut zoom_percent).suffix("%").clamp_range(10..=500).speed(1.0)).changed() {
                         zoom = zoom_percent as f32 / 100.0;
+                        self.fit_mode = PdfFitMode::Normal;
                     }
 
                     if (zoom - self.zoom).abs() > 0.001 {
@@ -2690,6 +2760,7 @@ impl eframe::App for TypesafeApp {
 
                     if ui.button("⟳").on_hover_text("Reset Zoom").clicked() {
                         self.zoom = 1.0;
+                        self.fit_mode = PdfFitMode::Normal;
                         self.pdf_textures.clear();
                     }
 
@@ -2725,6 +2796,30 @@ impl eframe::App for TypesafeApp {
                 // If log is shown, preview gets what's left minus header. If not, preview gets everything minus header.
                 // We reserve space for the toggle bar (log_header_height) and a generous buffer to prevent cutoff.
                 let preview_height = (total_height - log_height - log_header_height - 24.0).max(50.0);
+                let preview_container_width = ui.available_width();
+
+                // Auto-scale zoom if needed
+                if !self.page_sizes.is_empty() && self.fit_mode != PdfFitMode::Normal {
+                    if let Some((w, h)) = self.page_sizes.get(&self.current_page).or_else(|| self.page_sizes.values().next()) {
+                        let mut target_zoom = self.zoom;
+                        let available_w = (preview_container_width - 32.0).max(100.0);
+
+                        if self.fit_mode == PdfFitMode::FitWidth {
+                             target_zoom = available_w / w;
+                        } else if self.fit_mode == PdfFitMode::FitPage {
+                             let target_h = preview_height;
+                             let zoom_h = target_h / h;
+                             let zoom_w = available_w / w;
+                             target_zoom = zoom_h.min(zoom_w);
+                        }
+
+                        if (target_zoom - self.zoom).abs() > 0.005 {
+                             self.zoom = target_zoom;
+                             self.pdf_textures.clear();
+                             ctx.request_repaint();
+                        }
+                    }
+                }
 
                 // 1. PDF Preview
                 egui::ScrollArea::both()
@@ -2740,14 +2835,14 @@ impl eframe::App for TypesafeApp {
                                     if let Some(tex) = self.pdf_textures.get(&page_idx) {
                                         if let Some([w, h]) = self.preview_size {
                                         let aspect = w as f32 / h as f32;
-                                        let available_w = (ui.available_width() - 20.0).max(100.0);
-                                        let mut display_width = available_w * self.zoom;
-                                        if self.fit_mode == PdfFitMode::FitWidth {
-                                            display_width = available_w;
-                                        } else if self.fit_mode == PdfFitMode::FitPage {
-                                            // Fit to the calculated preview height
-                                            display_width = (preview_height * aspect).min(available_w);
-                                        }
+                                        // Use the container width captured outside the scroll area to avoid progressive scaling loop
+                                        let available_w = (preview_container_width - 20.0).max(100.0);
+                                        // With auto-zoom logic above, self.zoom should be correct for Fit modes
+                                        let display_width = if let Some((pw, _)) = self.page_sizes.get(&page_idx) {
+                                            pw * self.zoom
+                                        } else {
+                                            available_w * self.zoom
+                                        };
                                         let display_height = display_width / aspect;
 
                                         let img_resp = ui.add(egui::Image::new((
@@ -2956,6 +3051,19 @@ impl eframe::App for TypesafeApp {
                         });
                 }
             });
+        } else {
+             egui::SidePanel::right("preview_panel_slim")
+                .resizable(false)
+                .exact_width(32.0)
+                .show(ctx, |ui| {
+                    ui.add_space(8.0);
+                    ui.vertical_centered(|ui| {
+                        if ui.button("📄").on_hover_text("Expand Preview").clicked() {
+                            self.show_preview_panel = true;
+                        }
+                    });
+                });
+        }
 
         // Run debounced checks
         let now = ctx.input(|i| i.time);
@@ -2988,7 +3096,7 @@ impl eframe::App for TypesafeApp {
             ui.separator();
 
             // Quick insert toolbar
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
                 if ui.button(egui::RichText::new("𝐁").strong()).on_hover_text("Bold").clicked() { self.insert_snippet(ctx, "\\textbf{$1}"); }
                 if ui.button(egui::RichText::new("𝐼").italics()).on_hover_text("Italic").clicked() { self.insert_snippet(ctx, "\\textit{$1}"); }
@@ -4088,7 +4196,7 @@ fn main() -> Result<(), eframe::Error> {
     ensure_fontconfig();
 
     let mut viewport = egui::ViewportBuilder::default()
-        .with_min_inner_size([1200.0, 700.0])
+        .with_min_inner_size([800.0, 600.0])
         .with_maximized(true);
 
     if let Some(icon) = load_icon() {
