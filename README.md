@@ -1,64 +1,45 @@
-# TypeSafe
+# Typesafe LaTeX Editor
 
-TypeSafe is a modern, blazing fast LaTeX editor built with **Rust** and **egui**. It is designed for reliability, speed, and a crash-free experience.
+Typesafe is a fast, modern LaTeX editor built with Rust. It features live PDF preview, SyncTeX support, integrated dictionary/spellchecking, and extensive autocompletions.
 
-![TypeSafe Logo](web/logo.svg)
+## Building from Source
+
+Typesafe is designed to be easy to build. The application logic automatically locates required runtime resources (dependencies, dictionaries, autocomplete data) in the project root if they are not found immediately next to the executable.
+
+### 1. Build
+```bash
+cargo build --release
+```
+
+### 2. Run
+```bash
+target/release/typesafe.exe
+```
+
+That's it! The application will automatically locate:
+- `tectonic.exe` and `pdfium.dll` (in `deps/`)
+- `latex_data.json` (in project root)
+- `dictionary.txt` (in project root)
+- `icon.png` (in `deps/`)
+
+## Development (Optional)
+
+### Regenerating Autocomplete Data
+The project comes with a pre-generated `latex_data.json`. If you wish to regenerate the autocomplete dataset from the latest TeXStudio CWL files, you can run the ingestion tool:
+
+```bash
+cargo run --release --bin ingest_cwl
+```
+
+### Dependencies
+The `deps/` folder contains the necessary binaries for Windows (`tectonic.exe`, `pdfium.dll`). Ensure these are present if you are cloning the repo freshly (Note: Large binaries might need to be downloaded or tracked via LFS if not in the standard repo).
 
 ## Features
-
-- **Blazing Fast Compilation**: Powered by the [Tectonic](https://tectonic-typesetting.github.io/) engine.
-- **Live Preview**: Embedded PDF viewer using `pdfium-render` with fast refresh.
-- **SyncTeX Support**:
-  - **Forward Search**: Ctrl+J (or Right Click -> Go to PDF) to jump to the PDF location.
-  - **Inverse Search**: Double-click the PDF to jump to the source code.
-- **Offline Spell-Checking**: Built-in dictionary with suggestions.
-- **Thesaurus**: Online synonym lookup via Datamuse API.
-- **Auto-Complete**: Intelligent suggestions for LaTeX commands and environments.
-- **Memory Safe**: Written in Rust to prevent common crashes and segmentation faults.
-
-## Website
-
-The official website is hosted on Cloudflare Pages and includes the latest download link.
-Source code for the website is located in `web/`.
-
-## Installation
-
-### Download
-
-You can download the latest alpha release (`typesafe-alpha.zip`) from our website or build it yourself.
-
-### Build from Source
-
-**Prerequisites:**
-- Rust (Cargo) installed.
-- Windows (currently targeted platform, though Linux/macOS support is possible).
-
-**Steps:**
-
-1.  Clone the repository.
-2.  Build the release binary:
-    ```bash
-    cargo build --release
-    ```
-    This will compile the application. The executable will be located in `target/release/typesafe.exe`.
-
-    *Note: The build process automatically downloads necessary dependencies (`tectonic` and `pdfium`) into the `deps/` directory.*
-
-3.  **Run**:
-    You can run the application directly via Cargo:
-    ```bash
-    cargo run --release
-    ```
-
-    Or run the executable from `target/release/`. Ensure that `tectonic.exe` and `pdfium.dll` are accessible (either in the same directory, in a `deps/` subdirectory, or on your system PATH).
-
-## Project Structure
-
-- `src/`: Rust source code.
-- `web/`: React + Vite website source.
-- `deps/`: External binaries (Tectonic, PDFium) downloaded during build.
-- `build.rs`: Cargo build script for downloading dependencies.
+*   **Intelligent Autocomplete**: Thousands of LaTeX commands and environments.
+*   **Live Preview**: PDF rendering powered by Pdfium.
+*   **Inverse Search**: Double-click the PDF to jump to the corresponding line in the editor.
+*   **Theming**: Multiple built-in editor themes (Serendipity, Tokyo Night, etc.).
+*   **Spellcheck**: Real-time spellchecking.
 
 ## License
-
-MIT License.
+Refer to the `LICENSE` file for details.

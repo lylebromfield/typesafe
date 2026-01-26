@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+// Typesafe Editor
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use serde::{Deserialize, Serialize};
 use image;
@@ -18,13 +19,10 @@ use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 use flate2::read::GzDecoder;
 use std::io::Read;
-use resvg::usvg::{TreeParsing, TreeTextToPath};
+use std::io::Write;
 use unicode_segmentation::UnicodeSegmentation;
 
 const INDENT_UNIT: &str = "    ";
-
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
 
 // Themes
 
@@ -373,11 +371,13 @@ enum PdfFitMode {
 struct Diagnostic {
     message: String,
     line: usize,
+    #[allow(dead_code)]
     file: String,
 }
 
 enum CompilationMsg {
     Start,
+    #[allow(dead_code)]
     Log(String),
     Diagnostics(Vec<Diagnostic>),
     Success(PathBuf),
@@ -571,15 +571,10 @@ struct TypesafeApp {
     settings: Settings,
 
     // Autocomplete state
-    #[allow(dead_code)]
     completion_suggestions: Vec<(String, String)>,
-    #[allow(dead_code)]
     show_completions: bool,
-    #[allow(dead_code)]
     completion_popup_pos: egui::Pos2,
-    #[allow(dead_code)]
     completion_popup_rect: Option<egui::Rect>,
-    #[allow(dead_code)]
     completion_selected_index: usize,
 
     // Search and Replace
@@ -604,8 +599,118 @@ impl Default for TypesafeApp {
         let syntax_set = SyntaxSet::load_defaults_newlines();
         let theme_set = ThemeSet::load_defaults();
 
-        let latex_data: LatexData = serde_json::from_str(include_str!("../latex_data.json"))
-            .unwrap_or(LatexData { commands: Vec::new(), environments: Vec::new() });
+        // Ensure the latest latex_data.json is embedded, but allow runtime override
+        // Order: exe directory -> current working directory -> embedded
+        let latex_data: LatexData = {
+            #[allow(unused_assignments)]
+            let mut source = "embedded".to_string();
+            let log_path = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("typesafe_debug.log")))
+                .unwrap_or_else(|| std::path::PathBuf::from("typesafe_debug.log"));
+            let log_debug = |msg: &str| {
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log_path)
+                {
+                    let _ = writeln!(f, "{}", msg);
+                }
+            };
+            // 1) Try alongside the executable
+            if let Ok(exe_path) = std::env::current_exe() {
+                if let Some(exe_dir) = exe_path.parent() {
+                    let candidate = exe_dir.join("latex_data.json");
+                    let root_candidate = exe_dir.join("../../latex_data.json");
+
+                    if candidate.exists() {
+                        source = format!("exe_dir:{:?}", candidate);
+                        println!("Loading latex_data.json from exe dir: {:?}", candidate);
+                        if let Ok(content) = std::fs::read_to_string(&candidate) {
+                            if let Ok(data) = serde_json::from_str::<LatexData>(&content) {
+                                let samples = data.commands.iter().take(3).map(|c| c.trigger.clone()).collect::<Vec<_>>().join(", ");
+                                log_debug(&format!("latex_data source={} count_cmds={} count_envs={} samples=[{}]", source, data.commands.len(), data.environments.len(), samples));
+                                data
+                            } else {
+                                println!("Failed to parse {:?}, falling back to other sources", candidate);
+                                let data: LatexData = serde_json::from_str::<LatexData>(include_str!("../latex_data.json"))
+                                    .expect("Failed to parse embedded latex_data.json");
+                                let samples = data.commands.iter().take(3).map(|c| c.trigger.clone()).collect::<Vec<_>>().join(", ");
+                                log_debug(&format!("latex_data source={} count_cmds={} count_envs={} samples=[{}]", "embedded", data.commands.len(), data.environments.len(), samples));
+                                data
+                            }
+                        } else {
+                            let data: LatexData = serde_json::from_str(include_str!("../latex_data.json"))
+                                .expect("Failed to parse embedded latex_data.json");
+                            let samples = data.commands.iter().take(3).map(|c| c.trigger.clone()).collect::<Vec<_>>().join(", ");
+                            log_debug(&format!("latex_data source={} count_cmds={} count_envs={} samples=[{}]", "embedded", data.commands.len(), data.environments.len(), samples));
+                            data
+                        }
+                    } else if root_candidate.exists() {
+                         source = format!("root_dir:{:?}", root_candidate);
+                         println!("Loading latex_data.json from root dir: {:?}", root_candidate);
+                         if let Ok(content) = std::fs::read_to_string(&root_candidate) {
+                             if let Ok(data) = serde_json::from_str::<LatexData>(&content) {
+                                 let samples = data.commands.iter().take(3).map(|c| c.trigger.clone()).collect::<Vec<_>>().join(", ");
+                                 log_debug(&format!("latex_data source={} count_cmds={} count_envs={} samples=[{}]", source, data.commands.len(), data.environments.len(), samples));
+                                 data
+                             } else {
+                                 let data: LatexData = serde_json::from_str(include_str!("../latex_data.json")).expect("Failed to parse embedded");
+                                 data
+                             }
+                         } else {
+                             let data: LatexData = serde_json::from_str(include_str!("../latex_data.json")).expect("Failed to parse embedded");
+                             data
+                         }
+                    } else if let Ok(content) = std::fs::read_to_string("latex_data.json") {
+                        source = "cwd".to_string();
+                        println!("Loading latex_data.json from current dir: {:?}", std::env::current_dir());
+                        let data: LatexData = serde_json::from_str::<LatexData>(&content).unwrap_or_else(|e| {
+                            println!("Failed to parse file, falling back to embedded. Error: {}", e);
+                            source = "embedded".to_string();
+                            serde_json::from_str::<LatexData>(include_str!("../latex_data.json"))
+                                .expect("Failed to parse embedded latex_data.json")
+                        });
+                        let samples = data.commands.iter().take(3).map(|c| c.trigger.clone()).collect::<Vec<_>>().join(", ");
+                        log_debug(&format!("latex_data source={} count_cmds={} count_envs={} samples=[{}]", source, data.commands.len(), data.environments.len(), samples));
+                        data
+                    } else {
+                        println!("latex_data.json not found, falling back to embedded");
+                        let data: LatexData = serde_json::from_str(include_str!("../latex_data.json"))
+                            .expect("Failed to parse embedded latex_data.json");
+                        let samples = data.commands.iter().take(3).map(|c| c.trigger.clone()).collect::<Vec<_>>().join(", ");
+                        log_debug(&format!("latex_data source={} count_cmds={} count_envs={} samples=[{}]", "embedded", data.commands.len(), data.environments.len(), samples));
+                        data
+                    }
+                } else {
+                    let data: LatexData = serde_json::from_str::<LatexData>(include_str!("../latex_data.json"))
+                        .expect("Failed to parse embedded latex_data.json");
+                    let samples = data.commands.iter().take(3).map(|c| c.trigger.clone()).collect::<Vec<_>>().join(", ");
+                    log_debug(&format!("latex_data source={} count_cmds={} count_envs={} samples=[{}]", "embedded", data.commands.len(), data.environments.len(), samples));
+                    data
+                }
+            } else if let Ok(content) = std::fs::read_to_string("latex_data.json") {
+                source = "cwd".to_string();
+                println!("Loading latex_data.json from current dir: {:?}", std::env::current_dir());
+                let data: LatexData = serde_json::from_str::<LatexData>(&content).unwrap_or_else(|e| {
+                    println!("Failed to parse file, falling back to embedded. Error: {}", e);
+                    source = "embedded".to_string();
+                    serde_json::from_str::<LatexData>(include_str!("../latex_data.json"))
+                        .expect("Failed to parse embedded latex_data.json")
+                });
+                let samples = data.commands.iter().take(3).map(|c| c.trigger.clone()).collect::<Vec<_>>().join(", ");
+                log_debug(&format!("latex_data source={} count_cmds={} count_envs={} samples=[{}]", source, data.commands.len(), data.environments.len(), samples));
+                data
+            } else {
+                println!("latex_data.json not found, falling back to embedded");
+                let data: LatexData = serde_json::from_str::<LatexData>(include_str!("../latex_data.json"))
+                    .expect("Failed to parse embedded latex_data.json");
+                let samples = data.commands.iter().take(3).map(|c| c.trigger.clone()).collect::<Vec<_>>().join(", ");
+                log_debug(&format!("latex_data source={} count_cmds={} count_envs={} samples=[{}]", "embedded", data.commands.len(), data.environments.len(), samples));
+                data
+            }
+        };
+        println!("Loaded {} commands and {} environments", latex_data.commands.len(), latex_data.environments.len());
 
         let settings = Settings::load();
 
@@ -650,8 +755,16 @@ impl Default for TypesafeApp {
         // Initialize Dictionary
         let mut dictionary = std::collections::HashSet::new();
         let dict_path = std::path::Path::new("dictionary.txt");
+        let root_dict_path = std::path::Path::new("../../dictionary.txt");
+
         if dict_path.exists() {
             if let Ok(content) = std::fs::read_to_string(dict_path) {
+                for line in content.lines() {
+                    dictionary.insert(line.trim().to_lowercase());
+                }
+            }
+        } else if root_dict_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(root_dict_path) {
                 for line in content.lines() {
                     dictionary.insert(line.trim().to_lowercase());
                 }
@@ -714,6 +827,7 @@ impl Default for TypesafeApp {
             pdf_path: None,
             pdfium: Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path("."))
                 .or_else(|_| Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path("deps")))
+                .or_else(|_| Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path("../../deps")))
                 .or_else(|_| Pdfium::bind_to_system_library())
                 .map(Pdfium::new)
                 .ok(),
@@ -768,34 +882,41 @@ impl TypesafeApp {
         // Window styling
         visuals.window_fill = theme.bg_secondary;
         visuals.window_stroke = Stroke::new(1.0, theme.border);
-        visuals.window_rounding = Rounding::same(10.0);
+        visuals.window_rounding = Rounding::same(12.0);
         visuals.window_shadow = Shadow {
-            offset: Vec2::new(0.0, 4.0),
-            blur: 12.0,
+            offset: Vec2::new(0.0, 8.0),
+            blur: 24.0,
             spread: 0.0,
-            color: Color32::from_black_alpha(60),
+            color: Color32::from_black_alpha(40),
         };
 
-        // Text styles
+        // Widget styling (Modern/Sleek)
+        visuals.widgets.noninteractive.rounding = Rounding::same(6.0);
+        visuals.widgets.inactive.rounding = Rounding::same(6.0);
+        visuals.widgets.hovered.rounding = Rounding::same(6.0);
+        visuals.widgets.active.rounding = Rounding::same(6.0);
+        visuals.widgets.open.rounding = Rounding::same(6.0);
 
         // Widget backgrounds
         visuals.widgets.inactive.bg_fill = theme.bg_tertiary;
-        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, theme.border);
+        visuals.widgets.inactive.bg_stroke = Stroke::NONE; // Cleaner look without borders on idle buttons
 
-        visuals.widgets.hovered.bg_fill = theme.bg_tertiary.linear_multiply(1.2);
-        visuals.widgets.hovered.bg_stroke = Stroke::new(1.5, theme.accent);
-        visuals.widgets.hovered.fg_stroke = Stroke::new(1.5, theme.accent);
+        visuals.widgets.hovered.bg_fill = theme.bg_tertiary.linear_multiply(1.4);
+        visuals.widgets.hovered.bg_stroke = Stroke::NONE;
+        visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, theme.text_primary);
+        visuals.widgets.hovered.expansion = 2.0; // Subtle grow effect
 
-        visuals.widgets.active.bg_fill = theme.accent.linear_multiply(0.3);
-        visuals.widgets.active.bg_stroke = Stroke::new(1.5, theme.accent);
-        visuals.widgets.active.fg_stroke = Stroke::new(2.0, theme.accent);
+        visuals.widgets.active.bg_fill = theme.accent.linear_multiply(0.2);
+        visuals.widgets.active.bg_stroke = Stroke::new(1.0, theme.accent);
+        visuals.widgets.active.fg_stroke = Stroke::new(1.0, theme.accent);
+        visuals.widgets.active.expansion = 1.0;
 
-        visuals.widgets.open.bg_fill = theme.accent.linear_multiply(0.2);
-        visuals.widgets.open.bg_stroke = Stroke::new(1.5, theme.accent);
+        visuals.widgets.open.bg_fill = theme.accent.linear_multiply(0.15);
+        visuals.widgets.open.bg_stroke = Stroke::new(1.0, theme.accent);
 
         // Selection
-        visuals.selection.bg_fill = theme.accent.linear_multiply(0.4);
-        visuals.selection.stroke = Stroke::new(1.0, theme.accent);
+        visuals.selection.bg_fill = theme.accent.linear_multiply(0.3);
+        visuals.selection.stroke = Stroke::NONE;
 
         // Button styling
         visuals.widgets.inactive.weak_bg_fill = theme.bg_tertiary;
@@ -808,6 +929,16 @@ impl TypesafeApp {
         visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, theme.border);
 
         ctx.set_visuals(visuals);
+
+        // Modern Spacing
+        let mut style = (*ctx.style()).clone();
+        style.spacing.item_spacing = Vec2::new(8.0, 8.0);
+        style.spacing.window_margin = egui::Margin::same(12.0);
+        style.spacing.button_padding = Vec2::new(10.0, 6.0);
+        style.spacing.indent = 18.0;
+        style.spacing.scroll.bar_width = 10.0;
+        style.spacing.scroll.handle_min_length = 24.0;
+        ctx.set_style(style);
     }
 
     fn load_pdf_preview(&mut self, ctx: &egui::Context, pdf_path: &PathBuf) {
@@ -1034,6 +1165,20 @@ impl TypesafeApp {
         });
 
         self.is_compiling = true;
+    }
+
+    fn log_debug(&self, msg: &str) {
+        let log_path = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("typesafe_debug.log")))
+            .unwrap_or_else(|| std::path::PathBuf::from("typesafe_debug.log"));
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            let _ = writeln!(f, "[{:.3}] {}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64(), msg);
+        }
     }
 
     fn update_outline(&mut self) {
@@ -1960,6 +2105,55 @@ impl eframe::App for TypesafeApp {
                         ui.close_menu();
                     }
                     ui.separator();
+                    if ui.button("Reload LaTeX Data").clicked() {
+                        let mut success = false;
+                        let mut count = 0;
+                        let mut loaded_source = String::new();
+
+                        // Try exe dir first
+                        if let Ok(exe_path) = std::env::current_exe() {
+                            if let Some(exe_dir) = exe_path.parent() {
+                                let candidate = exe_dir.join("latex_data.json");
+                                if candidate.exists() {
+                                    if let Ok(content) = std::fs::read_to_string(&candidate) {
+                                        if let Ok(data) = serde_json::from_str::<LatexData>(&content) {
+                                            self.latex_commands = data.commands;
+                                            self.latex_environments = data.environments;
+                                            count = self.latex_commands.len() + self.latex_environments.len();
+                                            loaded_source = candidate.to_string_lossy().to_string();
+                                            success = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Try CWD if not found
+                        if !success {
+                            if let Ok(content) = std::fs::read_to_string("latex_data.json") {
+                                if let Ok(data) = serde_json::from_str::<LatexData>(&content) {
+                                    self.latex_commands = data.commands;
+                                    self.latex_environments = data.environments;
+                                    count = self.latex_commands.len() + self.latex_environments.len();
+                                    loaded_source = "CWD/latex_data.json".to_string();
+                                    success = true;
+                                }
+                            }
+                        }
+
+                        let msg = if success {
+                            format!("Successfully loaded {} items from {}", count, loaded_source)
+                        } else {
+                            "Failed to load latex_data.json. Ensure it exists next to the exe or in current working directory.".to_string()
+                        };
+
+                        rfd::MessageDialog::new()
+                            .set_title("Reload Data")
+                            .set_description(&msg)
+                            .show();
+                        ui.close_menu();
+                    }
+                    ui.separator();
                     if ui.button("Exit").clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
@@ -2064,11 +2258,7 @@ impl eframe::App for TypesafeApp {
                             .color(theme.text_primary)
                             .font(FontId::proportional(22.0)),
                     );
-                    ui.label(
-                        egui::RichText::new(format!(" | {}", self.file_path))
-                            .color(theme.text_secondary)
-                            .font(FontId::proportional(16.0)),
-                    );
+
                     if self.is_dirty {
                         ui.label(
                             egui::RichText::new("● Unsaved")
@@ -2371,21 +2561,15 @@ impl eframe::App for TypesafeApp {
                             ) {
                                 for node in nodes {
                                     ui.horizontal(|ui| {
-                                        ui.add_space(node.level as f32 * 10.0);
-                                        let collapse_icon = if node.children.is_empty() {
-                                            " "
-                                        } else if node.expanded {
-                                            "▼"
-                                        } else {
-                                            "▶"
-                                        };
+                                        ui.add_space(node.level as f32 * 16.0);
+                                        let collapse_icon = if node.expanded { "⏷" } else { "⏵" };
 
                                         if !node.children.is_empty() {
-                                            if ui.small_button(collapse_icon).clicked() {
+                                            if ui.add(egui::Button::new(collapse_icon).frame(false).small()).clicked() {
                                                 node.expanded = !node.expanded;
                                             }
                                         } else {
-                                            ui.label(collapse_icon);
+                                            ui.add_space(14.0);
                                         }
 
                                         let type_icon = match node.kind {
@@ -2486,7 +2670,13 @@ impl eframe::App for TypesafeApp {
 
                     // Zoom Controls
                     let mut zoom = self.zoom;
+                    if ui.button("➖").clicked() {
+                        zoom = (zoom - 0.1).clamp(0.5, 3.0);
+                    }
                     ui.add(egui::Slider::new(&mut zoom, 0.5..=3.0).step_by(0.05).show_value(false));
+                    if ui.button("➕").clicked() {
+                        zoom = (zoom + 0.1).clamp(0.5, 3.0);
+                    }
 
                     let mut zoom_percent = (zoom * 100.0).round() as u32;
                     if ui.add(egui::DragValue::new(&mut zoom_percent).suffix("%").clamp_range(10..=500).speed(1.0)).changed() {
@@ -2527,30 +2717,36 @@ impl eframe::App for TypesafeApp {
                     self.pdf_textures.clear();
                 }
 
-                // PDF Preview Area
-                let available_size = ui.available_size();
-                let scroll_height = available_size.y - if self.show_log { 160.0 } else { 30.0 };
+                // Top-down layout with manual height calculation for preview vs log
+                let total_height = ui.available_height();
+                let log_header_height = 30.0;
+                let log_height = if self.show_log { 150.0 } else { 0.0 };
 
+                // If log is shown, preview gets what's left minus header. If not, preview gets everything minus header.
+                // We reserve space for the toggle bar (log_header_height) and a generous buffer to prevent cutoff.
+                let preview_height = (total_height - log_height - log_header_height - 24.0).max(50.0);
+
+                // 1. PDF Preview
                 egui::ScrollArea::both()
-                    .auto_shrink([false; 2])
-                    .max_height(scroll_height)
+                    .id_source("pdf_preview_scroll")
+                    .max_height(preview_height)
                     .show(ui, |ui| {
                         ui.vertical_centered(|ui| {
                             if self.page_count > 0 {
                                 // Lazily render all pages
                                 for page_idx in 0..self.page_count {
-                                 self.render_page(ctx, page_idx);
+                                    self.render_page(ctx, page_idx);
 
-                                 if let Some(tex) = self.pdf_textures.get(&page_idx) {
-                                     if let Some([w, h]) = self.preview_size {
+                                    if let Some(tex) = self.pdf_textures.get(&page_idx) {
+                                        if let Some([w, h]) = self.preview_size {
                                         let aspect = w as f32 / h as f32;
                                         let available_w = (ui.available_width() - 20.0).max(100.0);
                                         let mut display_width = available_w * self.zoom;
                                         if self.fit_mode == PdfFitMode::FitWidth {
                                             display_width = available_w;
                                         } else if self.fit_mode == PdfFitMode::FitPage {
-                                            let by_height = scroll_height.max(50.0) * aspect;
-                                            display_width = by_height.min(available_w);
+                                            // Fit to the calculated preview height
+                                            display_width = (preview_height * aspect).min(available_w);
                                         }
                                         let display_height = display_width / aspect;
 
@@ -2623,34 +2819,34 @@ impl eframe::App for TypesafeApp {
                                                                                     }
                                                                                 }
                                                                             }
-                                                                        }
 
-                                                                        if best_line > 0 {
-                                                                            let line = best_line - 1;
-                                                                            // Calculate accurate char index (handling UTF-8 and mixed newlines)
-                                                                            let char_idx = if line == 0 { 0 } else {
-                                                                                self.editor_content.chars()
-                                                                                    .enumerate()
-                                                                                    .filter(|&(_, c)| c == '\n')
-                                                                                    .nth(line - 1)
-                                                                                    .map(|(i, _)| i + 1)
-                                                                                    .unwrap_or(0)
-                                                                            };
+                                                                            if best_line > 0 {
+                                                                                let line = best_line - 1;
+                                                                                // Calculate accurate char index (handling UTF-8 and mixed newlines)
+                                                                                let char_idx = if line == 0 { 0 } else {
+                                                                                    self.editor_content.chars()
+                                                                                        .enumerate()
+                                                                                        .filter(|&(_, c)| c == '\n')
+                                                                                        .nth(line - 1)
+                                                                                        .map(|(i, _)| i + 1)
+                                                                                        .unwrap_or(0)
+                                                                                };
 
-                                                                            if let Some(mut state) = egui::TextEdit::load_state(ctx, egui::Id::new("main_editor")) {
-                                                                                 // Calculate line length for selection
-                                                                                 let line_len = self.editor_content.chars().skip(char_idx).take_while(|&c| c != '\n').count();
+                                                                                if let Some(mut state) = egui::TextEdit::load_state(ctx, egui::Id::new("main_editor")) {
+                                                                                        // Calculate line length for selection
+                                                                                        let line_len = self.editor_content.chars().skip(char_idx).take_while(|&c| c != '\n').count();
 
-                                                                                 state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
-                                                                                     egui::text::CCursor::new(char_idx),
-                                                                                     egui::text::CCursor::new(char_idx + line_len)
-                                                                                 )));
-                                                                                 state.store(ctx, egui::Id::new("main_editor"));
+                                                                                        state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                                                                                            egui::text::CCursor::new(char_idx),
+                                                                                            egui::text::CCursor::new(char_idx + line_len)
+                                                                                        )));
+                                                                                        state.store(ctx, egui::Id::new("main_editor"));
 
-                                                                                 // Force focus to editor so it scrolls and shows cursor
-                                                                                 ctx.memory_mut(|m| m.request_focus(egui::Id::new("main_editor")));
-                                                                                 self.pending_cursor_scroll = Some(char_idx);
-                                                                                 jumped = true;
+                                                                                        // Force focus to editor so it scrolls and shows cursor
+                                                                                        ctx.memory_mut(|m| m.request_focus(egui::Id::new("main_editor")));
+                                                                                        self.pending_cursor_scroll = Some(char_idx);
+                                                                                        jumped = true;
+                                                                                }
                                                                             }
                                                                         }
                                                                     }
@@ -2706,46 +2902,50 @@ impl eframe::App for TypesafeApp {
                                         ui.add_space(10.0);
                                     }
                                 }
-                                }
-                            } else {
-                                ui.label(
-                                    egui::RichText::new(&self.preview_status)
-                                        .color(theme.text_secondary),
-                                );
                             }
-                        });
+                        } else {
+                            ui.label(
+                                egui::RichText::new(&self.preview_status)
+                                    .color(theme.text_secondary),
+                            );
+                        }
                     });
+                });
 
-                // Compilation Log
                 ui.separator();
+
+                // 2. Footer Bar (Log Toggle)
                 ui.horizontal(|ui| {
                     let icon = if self.show_log { "▼" } else { "▶" };
                     if ui.button(format!("{} Log", icon)).clicked() {
                         self.show_log = !self.show_log;
                     }
                     if !self.compilation_log.is_empty() {
-                         ui.label(egui::RichText::new(if self.is_compiling { "Compiling..." } else { "Status:" }).small());
+                            ui.label(egui::RichText::new(if self.is_compiling { "Compiling..." } else { "Status:" }).small());
                     }
                 });
+                ui.add_space(5.0);
 
+                // 3. Compilation Log (if shown)
                 if self.show_log {
+                    ui.separator();
                     egui::ScrollArea::vertical()
                         .id_source("log_scroll")
-                        .max_height(100.0)
+                        .max_height(ui.available_height())
                         .stick_to_bottom(true)
                         .show(ui, |ui| {
                             if !self.diagnostics.is_empty() {
-                                 ui.label(egui::RichText::new("Diagnostics (Click to Jump):").strong().color(egui::Color32::from_rgb(255, 100, 100)));
-                                 for diag in &self.diagnostics {
-                                     if ui.link(format!("Line {}: {}", diag.line, diag.message)).clicked() {
-                                         let char_idx = self.editor_content.lines().take(diag.line.saturating_sub(1)).map(|l| l.len() + 1).sum::<usize>();
-                                         if let Some(mut state) = egui::TextEdit::load_state(ctx, egui::Id::new("main_editor")) {
-                                              state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(char_idx))));
-                                              state.store(ctx, egui::Id::new("main_editor"));
-                                         }
-                                     }
-                                 }
-                                 ui.separator();
+                                    ui.label(egui::RichText::new("Diagnostics (Click to Jump):").strong().color(egui::Color32::from_rgb(255, 100, 100)));
+                                    for diag in &self.diagnostics {
+                                        if ui.link(format!("Line {}: {}", diag.line, diag.message)).clicked() {
+                                            let char_idx = self.editor_content.lines().take(diag.line.saturating_sub(1)).map(|l| l.len() + 1).sum::<usize>();
+                                            if let Some(mut state) = egui::TextEdit::load_state(ctx, egui::Id::new("main_editor")) {
+                                                state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(char_idx))));
+                                                state.store(ctx, egui::Id::new("main_editor"));
+                                            }
+                                        }
+                                    }
+                                    ui.separator();
                             }
                             ui.add(
                                 egui::TextEdit::multiline(&mut self.compilation_log)
@@ -3032,15 +3232,16 @@ impl eframe::App for TypesafeApp {
                         self.completion_selected_index += 1;
                     }
                 }
-                if ctx.input(|i| i.key_pressed(egui::Key::Tab) || (i.key_pressed(egui::Key::Enter) && i.modifiers.ctrl)) {
+                if ctx.input(|i| i.key_pressed(egui::Key::Tab) || i.key_pressed(egui::Key::Enter)) {
                     ctx.input_mut(|i| {
+                        i.consume_key(egui::Modifiers::NONE, egui::Key::Enter);
                         i.consume_key(egui::Modifiers::CTRL, egui::Key::Enter);
                         i.consume_key(egui::Modifiers::NONE, egui::Key::Tab);
                     });
-                    if let Some((completion, _)) = self.completion_suggestions.get(self.completion_selected_index) {
-                        let completion = completion.clone();
+                    if let Some((_, completion)) = self.completion_suggestions.get(self.completion_selected_index).cloned() {
                         self.apply_completion(ctx, &mut text, &completion);
                         self.show_completions = false;
+                        self.completion_suggestions.clear();
                         self.editor_content = text.clone();
                     }
                 }
@@ -3349,34 +3550,49 @@ impl eframe::App for TypesafeApp {
                                 let trigger_regex = regex::Regex::new(r"\\(ref|cite)\s*\{$").unwrap();
                                 let env_regex = regex::Regex::new(r"\\begin\{([a-zA-Z]*)$").unwrap();
 
+                                if !text_slice.is_empty() {
+                                    let last_few = if text_slice.len() > 30 { &text_slice[text_slice.len()-30..] } else { text_slice };
+                                    self.log_debug(&format!("Editor change: cursor={}, last_chars='{}'", idx, last_few));
+                                }
+
                                 if let Some(cap) = trigger_regex.captures(text_slice) {
                                     let command = cap.get(1).unwrap().as_str();
                                     self.show_completions = true;
                                     if command == "ref" {
-                                        self.completion_suggestions = self.labels.iter().map(|l| (l.clone(), "Label".to_string())).collect();
+                                        self.completion_suggestions = self.labels.iter().map(|l| (l.clone(), format!("\\ref{{{}}}", l))).collect();
                                     } else {
-                                        self.completion_suggestions = self.bib_items.iter().map(|b| (b.clone(), "Bib".to_string())).collect();
+                                        self.completion_suggestions = self.bib_items.iter().map(|b| (b.clone(), format!("\\cite{{{}}}", b))).collect();
                                     }
                                 } else if let Some(cap) = env_regex.captures(text_slice) {
                                     let query = cap.get(1).unwrap().as_str();
                                     self.completion_suggestions = self.latex_environments.iter()
                                          .filter(|env| env.trigger.starts_with(query))
-                                         .map(|env| (env.completion.clone(), "Env".to_string()))
+                                         .map(|env| (env.trigger.clone(), env.completion.clone()))
+                                         .take(50)
                                          .collect();
+                                    self.log_debug(&format!("Env trigger match: query='{}', suggestions={}", query, self.completion_suggestions.len()));
                                     if !self.completion_suggestions.is_empty() {
                                         self.show_completions = true;
                                     }
                                 } else if let Some(bs_idx) = text_slice.rfind('\\') {
                                     let after_bs = &text_slice[bs_idx+1..];
                                     // Check if it's a command being typed (no spaces, braces, etc)
-                                    if !after_bs.contains(|c: char| c.is_whitespace() || c == '{' || c == '[' || c == '}') && after_bs.chars().all(|c| c.is_alphabetic()) {
+                                    if !after_bs.contains(|c: char| c.is_whitespace() || c == '{' || c == '[' || c == '}' || c == '(' || c == ')') && (after_bs.is_empty() || after_bs.chars().all(|c| c.is_alphabetic())) {
                                          let query = after_bs;
                                          self.completion_suggestions = self.latex_commands.iter()
-                                             .filter(|cmd| cmd.trigger.starts_with(&format!("\\{}", query)))
-                                             .map(|cmd| (cmd.completion.clone(), "Cmd".to_string()))
+                                             .filter(|cmd| {
+                                                 cmd.trigger.starts_with(&format!("\\{}", query)) ||
+                                                 (cmd.trigger.starts_with(query) && !query.is_empty())
+                                             })
+                                             .map(|cmd| (cmd.trigger.clone(), cmd.completion.clone()))
+                                             .take(50)
                                              .collect();
 
-                                         if !self.completion_suggestions.is_empty() {
+                                         if !query.is_empty() {
+                                             self.log_debug(&format!("Command trigger match: query='{}', suggestions={}", query, self.completion_suggestions.len()));
+                                         }
+
+                                         if !self.completion_suggestions.is_empty() && !query.is_empty() {
                                              self.show_completions = true;
                                          }
                                     }
@@ -3476,87 +3692,6 @@ impl eframe::App for TypesafeApp {
                         }
                     }
 
-                    // Define LaTeX command completions
-                    let latex_completions: Vec<(&str, &str)> = vec![
-                        // Environments
-                        ("\\begin{equation}", "\\begin{equation}\n\t\n\\end{equation}"),
-                        ("\\begin{align}", "\\begin{align}\n\t\n\\end{align}"),
-                        ("\\begin{align*}", "\\begin{align*}\n\t\n\\end{align*}"),
-                        ("\\begin{itemize}", "\\begin{itemize}\n\t\\item \n\\end{itemize}"),
-                        ("\\begin{enumerate}", "\\begin{enumerate}\n\t\\item \n\\end{enumerate}"),
-                        ("\\begin{figure}", "\\begin{figure}[h]\n\t\\centering\n\t\\caption{}\n\\end{figure}"),
-                        ("\\begin{table}", "\\begin{table}[h]\n\t\\centering\n\t\\caption{}\n\\end{table}"),
-                        ("\\begin{description}", "\\begin{description}\n\t\\item[] \n\\end{description}"),
-
-                        // End Environments
-                        ("\\end{equation}", "\\end{equation}"),
-                        ("\\end{align}", "\\end{align}"),
-                        ("\\end{itemize}", "\\end{itemize}"),
-                        ("\\end{enumerate}", "\\end{enumerate}"),
-                        ("\\end{figure}", "\\end{figure}"),
-                        ("\\end{table}", "\\end{table}"),
-                        ("\\end{description}", "\\end{description}"),
-
-                        // Sections
-                        ("\\section", "\\section{}"),
-                        ("\\subsection", "\\subsection{}"),
-                        ("\\subsubsection", "\\subsubsection{}"),
-                        ("\\chapter", "\\chapter{}"),
-                        ("\\part", "\\part{}"),
-
-                        // Text formatting
-                        ("\\textbf{", "\\textbf{}"),
-                        ("\\textit{", "\\textit{}"),
-                        ("\\texttt{", "\\texttt{}"),
-                        ("\\underline{", "\\underline{}"),
-                        ("\\emph{", "\\emph{}"),
-
-                        // Math mode
-                        ("\\frac{", "\\frac{}{}"),
-                        ("\\sqrt{", "\\sqrt{}"),
-                        ("\\sum", "\\sum_{n=1}^{N}"),
-                        ("\\int", "\\int_{a}^{b}"),
-                        ("\\lim", "\\lim_{x \\to 0}"),
-
-                        // References
-                        ("\\label{", "\\label{}"),
-                        ("\\ref{", "\\ref{}"),
-                        ("\\cite{", "\\cite{}"),
-
-                        // Document structure
-                        ("\\documentclass{", "\\documentclass{}"),
-                        ("\\usepackage{", "\\usepackage{}"),
-                        ("\\usepackage[", "\\usepackage[]{}"),
-
-                        // Graphics
-                        ("\\includegraphics{", "\\includegraphics{}"),
-                        ("\\includegraphics[", "\\includegraphics[width=]{}"),
-                        ("[h]", "[h]"),
-                        ("[t]", "[t]"),
-                        ("[width=]", "[width=]"),
-                        ("[scale=]", "[scale=]"),
-                        ("\\caption{", "\\caption{}"),
-
-                        // Other
-                        ("\\item ", "\\item "),
-                        ("\\centering", "\\centering"),
-                        ("\\input{", "\\input{}"),
-                        ("\\include{", "\\include{}"),
-                        ("\\footnote{", "\\footnote{}"),
-                        ("\\maketitle", "\\maketitle"),
-                        ("\\tableofcontents", "\\tableofcontents"),
-                        ("\\newpage", "\\newpage"),
-                        ("\\begin{document}", "\\begin{document}"),
-                        ("\\end{document}", "\\end{document}"),
-                        ("\\begin{itemize}", "\\begin{itemize}\n    \\item \n\\end{itemize}"),
-                        ("\\begin{enumerate}", "\\begin{enumerate}\n    \\item \n\\end{enumerate}"),
-                        ("\\begin{figure}", "\\begin{figure}[h]\n    \\centering\n    \\caption{}\n\\end{figure}"),
-                        ("\\usepackage{", "\\usepackage{}"),
-                        ("\\documentclass{", "\\documentclass{}"),
-                        ("\\include{", "\\include{}"),
-                        ("\\input{", "\\input{}"),
-                    ];
-
                     // Handle Tab key
                     if response.has_focus()
                         && ctx.input(|i| i.key_pressed(egui::Key::Tab) && i.modifiers.is_none())
@@ -3565,102 +3700,41 @@ impl eframe::App for TypesafeApp {
                         text.insert_str(text.len(), "    ");
                     }
 
-                    // Handle Acceptance
-                    let mut accepted = false;
-                    if self.show_completions && !self.completion_suggestions.is_empty() {
-                        let ctrl_space_pressed = ctx.input(|i| i.key_pressed(egui::Key::Space) && i.modifiers.ctrl);
-
-                        if ctrl_space_pressed {
-                            ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Space));
-
-                            if let Some((_, completion)) = self.completion_suggestions.get(self.completion_selected_index).cloned() {
-                                self.apply_completion(ctx, &mut text, &completion);
-                                self.show_completions = false;
-                                self.completion_suggestions.clear();
-                                accepted = true;
-                            }
-                        }
-                    }
-
-                    // Autocomplete Logic (Open / Update)
-                    let ctrl_space = !accepted && response.has_focus()
-                        && ctx.input(|i| i.key_pressed(egui::Key::Space) && i.modifiers.ctrl);
-
-                    if ctrl_space {
+                    // Handle Manual Completion Request (Ctrl+Space)
+                    if response.has_focus() && ctx.input(|i| i.key_pressed(egui::Key::Space) && i.modifiers.ctrl) {
                         ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Space));
-                    }
 
-                    // Trigger if Ctrl+Space OR if text changed while focused
-                    if ctrl_space || (response.has_focus() && response.changed() && !accepted) {
-                        // Get the actual cursor position from the editor state
-                        let cursor_idx = if let Some(state) = egui::TextEdit::load_state(ctx, editor_id) {
+                        if let Some(state) = egui::TextEdit::load_state(ctx, editor_id) {
                             if let Some(range) = state.cursor.char_range() {
-                                range.primary.index
-                            } else {
-                                text.chars().count()
+                                let idx = range.primary.index;
+                                let text_slice = &text[..idx];
+
+                                // Force completion trigger by scanning backwards for a backslash
+                                if let Some(bs_idx) = text_slice.rfind('\\') {
+                                    let after_bs = &text_slice[bs_idx+1..];
+                                    if after_bs.chars().all(|c| c.is_alphabetic()) {
+                                        let query = after_bs;
+                                        self.completion_suggestions = self.latex_commands.iter()
+                                            .filter(|cmd| {
+                                                cmd.trigger.starts_with(&format!("\\{}", query)) ||
+                                                (cmd.trigger.starts_with(query) && !query.is_empty())
+                                            })
+                                            .map(|cmd| (cmd.trigger.clone(), cmd.completion.clone()))
+                                            .take(50)
+                                            .collect();
+
+                                        if !self.completion_suggestions.is_empty() {
+                                            self.show_completions = true;
+                                            self.completion_selected_index = 0;
+
+                                            let galley = output.inner.galley.clone();
+                                            let cursor = galley.from_ccursor(range.primary);
+                                            let cursor_rect = galley.pos_from_cursor(&cursor);
+                                            self.completion_popup_pos = response.rect.min + cursor_rect.max.to_vec2() + egui::vec2(0.0, 5.0);
+                                        }
+                                    }
+                                }
                             }
-                        } else {
-                            text.chars().count()
-                        };
-
-                        let mut word_start = cursor_idx;
-                        let chars: Vec<char> = text.chars().collect();
-
-                        // Scan backwards to find word boundary
-                        while word_start > 0 {
-                            let prev_char = chars[word_start - 1];
-                            let is_word_char = prev_char.is_alphanumeric() || prev_char == '\\' || prev_char == '[' || prev_char == '{' || prev_char == '_' || prev_char == '*';
-
-                            if !is_word_char {
-                                break;
-                            }
-                            word_start -= 1;
-                        }
-
-                        // Extract the word being completed
-                        let word: String = chars[word_start..cursor_idx].iter().collect();
-
-                        // Find matching completions
-                        let mut matches: Vec<(&str, &str)> = latex_completions
-                            .iter()
-                            .filter(|(trigger, _)| trigger.starts_with(word.as_str()) && trigger.len() >= word.len())
-                            .copied()
-                            .collect();
-
-                        // If explicitly requested, allow empty word matches
-                        // If implicit (typing), require at least one char
-                        let should_show = !matches.is_empty() && (ctrl_space || word.len() > 0);
-
-                        if should_show {
-                            // Sort by trigger length
-                            matches.sort_by_key(|(t, _)| t.len());
-
-                            // Store suggestions for dropdown
-                            self.completion_suggestions = matches.iter()
-                                .map(|(trigger, completion)| (trigger.to_string(), completion.to_string()))
-                                .collect();
-                            self.completion_selected_index = 0;
-
-                            // Calculate popup position based on cursor location
-                            let font_id = egui::TextStyle::Monospace.resolve(ui.style());
-                            let row_height = ui.fonts(|f| f.row_height(&font_id));
-                            let char_width = ui.fonts(|f| f.glyph_width(&font_id, ' '));
-
-                            // Find line and column (cursor_idx is char index)
-                            let line = chars[..cursor_idx].iter().filter(|&&c| c == '\n').count();
-                            let last_newline_idx = chars[..cursor_idx].iter().rposition(|&c| c == '\n').map(|i| i + 1).unwrap_or(0);
-                            let col = cursor_idx - last_newline_idx;
-
-                            // Estimate position (relative to text edit top-left)
-                            let x_offset = col as f32 * char_width;
-                            let y_offset = (line + 1) as f32 * row_height;
-
-                            self.completion_popup_pos = response.rect.min + egui::vec2(x_offset + 8.0, y_offset);
-                            self.show_completions = true;
-                        } else if !ctrl_space {
-                             self.show_completions = false;
-                             self.completion_suggestions.clear();
-                             self.completion_selected_index = 0;
                         }
                     }
 
@@ -3913,6 +3987,12 @@ fn locate_tectonic() -> String {
             if candidate_deps.exists() {
                  return candidate_deps.to_string_lossy().into_owned();
             }
+
+            // Check root deps relative to target/release (../../deps)
+            let candidate_root_deps = parent.join("../../deps").join(exe_name);
+            if candidate_root_deps.exists() {
+                return candidate_root_deps.to_string_lossy().into_owned();
+            }
         }
     }
 
@@ -3973,61 +4053,19 @@ fn render_pdf_page_to_texture(
 }
 
 fn load_icon() -> Option<egui::IconData> {
-    // Try to update icon from SVG if present
-    let svg_path = std::path::Path::new("web/logo.svg");
     let png_path = std::path::Path::new("icon.png");
-    let ico_path = std::path::Path::new("icon.ico");
-
-    if svg_path.exists() {
-        let should_update = if !png_path.exists() || !ico_path.exists() {
-            true
-        } else if let (Ok(m1), Ok(m2)) = (svg_path.metadata(), png_path.metadata()) {
-            if let (Ok(t1), Ok(t2)) = (m1.modified(), m2.modified()) {
-                t1 > t2
-            } else { false }
-        } else { false };
-
-        if should_update {
-            if let Ok(data) = std::fs::read(svg_path) {
-                let opt = resvg::usvg::Options::default();
-                if let Ok(mut tree) = resvg::usvg::Tree::from_data(&data, &opt) {
-                     let mut fontdb = resvg::usvg::fontdb::Database::new();
-                     fontdb.load_system_fonts();
-                     tree.convert_text(&fontdb);
-
-                     let size = tree.size;
-                     let width_f = size.width();
-                     let height_f = size.height();
-
-                     // Target 256px
-                     let target_size = 256.0f32;
-                     let scale = (target_size / width_f).min(target_size / height_f);
-
-                     let width = (width_f * scale).ceil() as u32;
-                     let height = (height_f * scale).ceil() as u32;
-
-                     if let Some(mut pixmap) = resvg::tiny_skia::Pixmap::new(width, height) {
-                         let rtree = resvg::Tree::from_usvg(&tree);
-                         let transform = resvg::tiny_skia::Transform::from_scale(scale, scale);
-                         rtree.render(transform, &mut pixmap.as_mut());
-                         let _ = pixmap.save_png(png_path);
-
-                         // Generate ICO for Windows build
-                         if let Ok(png_data) = pixmap.encode_png() {
-                             if let Ok(img) = image::load_from_memory(&png_data) {
-                                 let _ = img.save_with_format("icon.ico", image::ImageFormat::Ico);
-                             }
-                         }
-                     }
-                }
-            }
-        }
-    }
+    let deps_path = std::path::Path::new("deps/icon.png");
+    let root_deps_path = std::path::Path::new("../../deps/icon.png");
+    let root_path = std::path::Path::new("../../icon.png");
 
     let icon_path = if png_path.exists() {
-        "icon.png"
-    } else if std::path::Path::new("deps/icon.png").exists() {
-        "deps/icon.png"
+        std::path::Path::new("icon.png")
+    } else if deps_path.exists() {
+        deps_path
+    } else if root_deps_path.exists() {
+        root_deps_path
+    } else if root_path.exists() {
+        root_path
     } else {
         return None;
     };
@@ -4047,13 +4085,6 @@ fn load_icon() -> Option<egui::IconData> {
 }
 
 fn main() -> Result<(), eframe::Error> {
-    // Check for icon generation flag
-    let args: Vec<String> = std::env::args().collect();
-    if args.contains(&"--gen-icon".to_string()) {
-        let _ = load_icon();
-        return Ok(());
-    }
-
     ensure_fontconfig();
 
     let mut viewport = egui::ViewportBuilder::default()

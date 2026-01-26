@@ -3,14 +3,14 @@ extern crate winres;
 
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
     #[cfg(windows)]
     {
         let mut res = winres::WindowsResource::new();
-        if std::path::Path::new("icon.ico").exists() {
+        if Path::new("icon.ico").exists() {
             res.set_icon("icon.ico");
         }
         res.compile().unwrap();
@@ -18,146 +18,140 @@ fn main() {
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=icon.ico");
-    let out_dir = env::var("OUT_DIR").unwrap();
-    let out_path = PathBuf::from(&out_dir);
+    println!("cargo:rerun-if-changed=latex_data.json");
 
-    // Get the target directory
-    let target_dir = out_path
-        .ancestors()
-        .find(|p| p.file_name().map_or(false, |n| n == "target"))
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
-
-    let deps_dir = if let Some(parent) = target_dir.parent() {
-        parent.to_path_buf().join("deps")
-    } else {
-        PathBuf::from("deps")
-    };
+    // Get the project root directory
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
+    let root_dir = PathBuf::from(manifest_dir);
+    let deps_dir = root_dir.join("deps");
 
     // Create deps directory
     let _ = fs::create_dir_all(&deps_dir);
 
-    let pdfium_path = deps_dir.join("pdfium.dll");
+    // Determine filenames based on OS
+    let (pdfium_file, tectonic_file) = if cfg!(windows) {
+        ("pdfium.dll", "tectonic.exe")
+    } else if cfg!(target_os = "macos") {
+        ("libpdfium.dylib", "tectonic")
+    } else {
+        ("libpdfium.so", "tectonic")
+    };
 
-    // Only download if pdfium.dll doesn't exist
+    let pdfium_path = deps_dir.join(pdfium_file);
     if !pdfium_path.exists() {
-        println!("cargo:warning=Downloading pdfium.dll...");
-
-        if let Err(e) = download_pdfium(&deps_dir) {
+        println!("cargo:warning=Downloading {}...", pdfium_file);
+        if let Err(e) = download_pdfium(&deps_dir, pdfium_file) {
             println!("cargo:warning=Failed to download pdfium: {}", e);
-            println!("cargo:warning=Please manually download from: https://github.com/bblanchon/pdfium-binaries/releases");
         }
     }
 
-    let tectonic_path = deps_dir.join("tectonic.exe");
+    let tectonic_path = deps_dir.join(tectonic_file);
     if !tectonic_path.exists() {
-        println!("cargo:warning=Downloading tectonic.exe...");
-        if let Err(e) = download_tectonic(&deps_dir) {
+        println!("cargo:warning=Downloading {}...", tectonic_file);
+        if let Err(e) = download_tectonic(&deps_dir, tectonic_file) {
             println!("cargo:warning=Failed to download tectonic: {}", e);
         }
     }
 
-    // Tell cargo to link the library
+    // Tell cargo where to find native libraries
     println!("cargo:rustc-link-search=native={}", deps_dir.display());
 }
 
-fn download_pdfium(deps_dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    let tgz_path = deps_dir.join("pdfium-temp.tgz");
-    let url = "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/7643/pdfium-win-x64.tgz";
-
-    // Try using PowerShell on Windows
-    #[cfg(target_os = "windows")]
-    {
-        let download_cmd = format!(
-            "$ProgressPreference = 'SilentlyContinue'; Invoke-WebRequest -Uri '{}' -OutFile '{}'",
-            url, tgz_path.display()
-        );
-
-        let output = Command::new("powershell")
-            .args(&["-Command", &download_cmd])
-            .output()?;
-
-        if !output.status.success() {
-            return Err("PowerShell download failed".into());
+fn download_pdfium(deps_dir: &Path, target_file: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let version = "7643";
+    let url = if cfg!(windows) {
+        format!("https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/{}/pdfium-win-x64.tgz", version)
+    } else if cfg!(target_os = "macos") {
+        if cfg!(target_arch = "aarch64") {
+            format!("https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/{}/pdfium-mac-arm64.tgz", version)
+        } else {
+            format!("https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/{}/pdfium-mac-x64.tgz", version)
         }
+    } else {
+        format!("https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/{}/pdfium-linux-x64.tgz", version)
+    };
 
-        // Extract the TGZ file using tar command (available on Windows 10+)
-        let extract_output = Command::new("tar")
-            .args(&["-xzf", tgz_path.to_str().unwrap(), "-C", deps_dir.to_str().unwrap()])
-            .output()?;
+    let archive_path = deps_dir.join("pdfium.tgz");
+    download_file(&url, &archive_path)?;
 
-        if !extract_output.status.success() {
-            return Err("Tar extraction failed".into());
-        }
-
-        // Copy pdfium.dll from bin to deps root
-        let bin_dll = deps_dir.join("bin").join("pdfium.dll");
-        let deps_dll = deps_dir.join("pdfium.dll");
-
-        if bin_dll.exists() {
-            fs::copy(&bin_dll, &deps_dll)?;
-        }
-
-        // Clean up
-        let _ = fs::remove_dir_all(deps_dir.join("bin"));
-        let _ = fs::remove_dir_all(deps_dir.join("include"));
-        let _ = fs::remove_dir_all(deps_dir.join("lib"));
-        let _ = fs::remove_dir_all(deps_dir.join("licenses"));
-        let _ = fs::remove_file(&tgz_path);
-        let _ = fs::remove_file(deps_dir.join("LICENSE"));
-        let _ = fs::remove_file(deps_dir.join("VERSION"));
-        let _ = fs::remove_file(deps_dir.join("PDFiumConfig.cmake"));
-        let _ = fs::remove_file(deps_dir.join("args.gn"));
-
-        Ok(())
+    // Extract
+    let mut cmd = Command::new("tar");
+    cmd.args(&["-xzf", archive_path.to_str().unwrap(), "-C", deps_dir.to_str().unwrap()]);
+    let output = cmd.output()?;
+    if !output.status.success() {
+        return Err(format!("Extraction failed: {}", String::from_utf8_lossy(&output.stderr)).into());
     }
 
-    #[cfg(not(target_os = "windows"))]
-    {
-        Err("pdfium download is currently only supported on Windows".into())
+    // Move library to root of deps folder
+    let subdirs = ["bin", "lib"];
+    for subdir in subdirs {
+        let candidate = deps_dir.join(subdir).join(target_file);
+        if candidate.exists() {
+            fs::copy(&candidate, deps_dir.join(target_file))?;
+            break;
+        }
     }
+
+    // Cleanup
+    let _ = fs::remove_file(&archive_path);
+    let _ = fs::remove_dir_all(deps_dir.join("bin")).ok();
+    let _ = fs::remove_dir_all(deps_dir.join("lib")).ok();
+    let _ = fs::remove_dir_all(deps_dir.join("include")).ok();
+
+    Ok(())
 }
 
-fn download_tectonic(deps_dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    let zip_path = deps_dir.join("tectonic.zip");
-    // Using a fixed version (0.15.0)
-    let url = "https://github.com/tectonic-typesetting/tectonic/releases/download/tectonic@0.15.0/tectonic-0.15.0-x86_64-pc-windows-msvc.zip";
+fn download_tectonic(deps_dir: &Path, _target_file: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let version = "0.15.0";
+    let (url, is_zip) = if cfg!(windows) {
+        (format!("https://github.com/tectonic-typesetting/tectonic/releases/download/tectonic@{}/tectonic-{}-x86_64-pc-windows-msvc.zip", version, version), true)
+    } else if cfg!(target_os = "macos") {
+        (format!("https://github.com/tectonic-typesetting/tectonic/releases/download/tectonic@{}/tectonic-{}-x86_64-apple-darwin.tar.gz", version, version), false)
+    } else {
+        (format!("https://github.com/tectonic-typesetting/tectonic/releases/download/tectonic@{}/tectonic-{}-x86_64-unknown-linux-musl.tar.gz", version, version), false)
+    };
 
-    #[cfg(target_os = "windows")]
-    {
+    let archive_path = deps_dir.join(if is_zip { "tectonic.zip" } else { "tectonic.tar.gz" });
+    download_file(&url, &archive_path)?;
+
+    if is_zip {
+        #[cfg(windows)]
+        {
+            let unzip_cmd = format!(
+                "Expand-Archive -Path '{}' -DestinationPath '{}' -Force",
+                archive_path.display(), deps_dir.display()
+            );
+            Command::new("powershell").args(&["-Command", &unzip_cmd]).output()?;
+        }
+        #[cfg(not(windows))]
+        {
+            Command::new("unzip").args(&["-o", archive_path.to_str().unwrap(), "-d", deps_dir.to_str().unwrap()]).output()?;
+        }
+    } else {
+        Command::new("tar").args(&["-xzf", archive_path.to_str().unwrap(), "-C", deps_dir.to_str().unwrap()]).output()?;
+    }
+
+    let _ = fs::remove_file(&archive_path);
+    Ok(())
+}
+
+fn download_file(url: &str, dest: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    if cfg!(windows) {
         let download_cmd = format!(
             "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; $ProgressPreference = 'SilentlyContinue'; Invoke-WebRequest -Uri '{}' -OutFile '{}'",
-            url, zip_path.display()
+            url, dest.display()
         );
-
-        let output = Command::new("powershell")
-            .args(&["-Command", &download_cmd])
-            .output()?;
-
+        let output = Command::new("powershell").args(&["-Command", &download_cmd]).output()?;
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("PowerShell download failed: {}", stderr).into());
+            return Err(format!("PowerShell download failed: {}", String::from_utf8_lossy(&output.stderr)).into());
         }
-
-        let unzip_cmd = format!(
-            "Expand-Archive -Path '{}' -DestinationPath '{}' -Force",
-            zip_path.display(), deps_dir.display()
-        );
-
-        let extract_output = Command::new("powershell")
-            .args(&["-Command", &unzip_cmd])
+    } else {
+        let output = Command::new("curl")
+            .args(&["-L", url, "-o", dest.to_str().unwrap()])
             .output()?;
-
-        if !extract_output.status.success() {
-             return Err("Unzip failed".into());
+        if !output.status.success() {
+            return Err(format!("curl download failed: {}", String::from_utf8_lossy(&output.stderr)).into());
         }
-
-        let _ = fs::remove_file(&zip_path);
-        Ok(())
     }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        Err("tectonic download is currently only supported on Windows".into())
-    }
+    Ok(())
 }

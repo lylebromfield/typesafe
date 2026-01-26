@@ -42,7 +42,7 @@ const Hero: React.FC = () => {
       </div>
 
       <div className="mt-8 text-sm text-gruvbox-gray font-mono">
-        v0.2.0 • macOS, Linux, Windows
+        v0.3.0 • macOS, Linux, Windows
       </div>
     </div>
   );

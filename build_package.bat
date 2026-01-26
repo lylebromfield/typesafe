@@ -7,10 +7,14 @@ cd /d "%~dp0"
 echo [INFO] Starting build...
 
 REM ------------------------------------------------------------------
-REM Generate Assets (Before build to embed resources)
+REM Generate Data
 REM ------------------------------------------------------------------
-echo [INFO] Generating icon resources...
-cargo run -- --gen-icon
+echo [INFO] Generating latex_data.json...
+cargo run --release --bin ingest_cwl
+if %errorlevel% neq 0 (
+    echo [ERROR] Data generation failed.
+    exit /b %errorlevel%
+)
 
 REM ------------------------------------------------------------------
 REM Build Release
@@ -47,6 +51,10 @@ if exist "dictionary.txt" (
     echo Copying dictionary.txt to target/release...
     copy /y "dictionary.txt" "target\release\" >nul
 )
+if exist "latex_data.json" (
+    echo Copying latex_data.json to target/release...
+    copy /y "latex_data.json" "target\release\" >nul
+)
 
 REM ------------------------------------------------------------------
 REM Create Distribution Archive (for Web)
@@ -62,6 +70,7 @@ copy /y "target\release\typesafe.exe" "release_dist\" >nul
 if exist "deps\tectonic.exe" copy /y "deps\tectonic.exe" "release_dist\" >nul
 if exist "deps\pdfium.dll" copy /y "deps\pdfium.dll" "release_dist\" >nul
 if exist "dictionary.txt" copy /y "dictionary.txt" "release_dist\" >nul
+if exist "latex_data.json" copy /y "latex_data.json" "release_dist\" >nul
 if exist "web\logo.svg" copy /y "web\logo.svg" "release_dist\web\" >nul
 if exist "icon.png" copy /y "icon.png" "release_dist\" >nul
 
