@@ -393,6 +393,8 @@ enum SettingsTab {
     Editor,
     Permissions,
     APIs,
+    About,
+    License,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -419,7 +421,7 @@ fn default_true() -> bool { true }
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            theme: ThemePreset::GruvboxDark,
+            theme: ThemePreset::Dark,
             accent: AccentColor::Orange,
             show_settings_window: false,
             active_tab: SettingsTab::Appearance,
@@ -590,6 +592,11 @@ struct TypesafeApp {
     last_save_time: f64,
     latex_commands: Vec<LatexItem>,
     latex_environments: Vec<LatexItem>,
+
+    // Documentation
+    readme_content: &'static str,
+    license_content: &'static str,
+    markdown_cache: egui_commonmark::CommonMarkCache,
 }
 
 impl Default for TypesafeApp {
@@ -794,7 +801,7 @@ impl Default for TypesafeApp {
             }
         }
 
-        Self {
+        let mut app = Self {
             editor_content: default_content,
             file_path: default_file,
             current_dir,
@@ -860,6 +867,9 @@ impl Default for TypesafeApp {
             completion_selected_index: 0,
             latex_commands: latex_data.commands,
             latex_environments: latex_data.environments,
+            readme_content: include_str!("../README.md"),
+            license_content: include_str!("../LICENSE"),
+            markdown_cache: egui_commonmark::CommonMarkCache::default(),
 
             show_search: false,
             search_query: String::new(),
@@ -869,7 +879,13 @@ impl Default for TypesafeApp {
             search_matches: Vec::new(),
             search_match_index: 0,
             last_save_time: 0.0,
+        };
+
+        if !app.file_path.is_empty() && !app.file_path.ends_with("untitled.tex") {
+            app.update_outline();
         }
+
+        app
     }
 }
 
@@ -895,20 +911,23 @@ impl TypesafeApp {
         };
 
         // Widget styling (Modern/Sleek)
-        visuals.widgets.noninteractive.rounding = Rounding::same(6.0);
-        visuals.widgets.inactive.rounding = Rounding::same(6.0);
-        visuals.widgets.hovered.rounding = Rounding::same(6.0);
-        visuals.widgets.active.rounding = Rounding::same(6.0);
-        visuals.widgets.open.rounding = Rounding::same(6.0);
+        visuals.widgets.noninteractive.rounding = Rounding::same(4.0);
+        visuals.widgets.inactive.rounding = Rounding::same(4.0);
+        visuals.widgets.hovered.rounding = Rounding::same(4.0);
+        visuals.widgets.active.rounding = Rounding::same(4.0);
+        visuals.widgets.open.rounding = Rounding::same(4.0);
 
         // Widget backgrounds
-        visuals.widgets.inactive.bg_fill = theme.bg_tertiary;
+        visuals.widgets.inactive.bg_fill = Color32::TRANSPARENT;
         visuals.widgets.inactive.bg_stroke = Stroke::NONE; // Cleaner look without borders on idle buttons
 
-        visuals.widgets.hovered.bg_fill = theme.bg_tertiary.linear_multiply(1.4);
+        // Use text color with low opacity for hover (works for both light and dark themes)
+        let mut hover_color = theme.text_primary;
+        hover_color = Color32::from_rgba_unmultiplied(hover_color.r(), hover_color.g(), hover_color.b(), 25);
+        visuals.widgets.hovered.bg_fill = hover_color;
         visuals.widgets.hovered.bg_stroke = Stroke::NONE;
         visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, theme.text_primary);
-        visuals.widgets.hovered.expansion = 2.0; // Subtle grow effect
+        visuals.widgets.hovered.expansion = 1.0; // Subtle grow effect
 
         visuals.widgets.active.bg_fill = theme.accent.linear_multiply(0.2);
         visuals.widgets.active.bg_stroke = Stroke::new(1.0, theme.accent);
@@ -923,7 +942,7 @@ impl TypesafeApp {
         visuals.selection.stroke = Stroke::NONE;
 
         // Button styling
-        visuals.widgets.inactive.weak_bg_fill = theme.bg_tertiary;
+        visuals.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
 
         // Separator
         visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, theme.border);
@@ -2231,6 +2250,9 @@ impl eframe::App for TypesafeApp {
                     if ui.checkbox(&mut self.show_file_panel, "File Explorer").clicked() {
                         ui.close_menu();
                     }
+                    if ui.checkbox(&mut self.show_preview_panel, "PDF Preview").clicked() {
+                        ui.close_menu();
+                    }
                     if ui.checkbox(&mut self.show_log, "Compilation Log").clicked() {
                         ui.close_menu();
                     }
@@ -2284,7 +2306,13 @@ impl eframe::App for TypesafeApp {
                  // Help Menu
                 ui.menu_button("Help", |ui| {
                     if ui.button("About").clicked() {
-                        // Placeholder
+                        self.settings.active_tab = SettingsTab::About;
+                        self.settings.show_settings_window = true;
+                        ui.close_menu();
+                    }
+                    if ui.button("License").clicked() {
+                        self.settings.active_tab = SettingsTab::License;
+                        self.settings.show_settings_window = true;
                         ui.close_menu();
                     }
                 });
@@ -2328,6 +2356,8 @@ impl eframe::App for TypesafeApp {
                         ui.selectable_value(&mut self.settings.active_tab, SettingsTab::Editor, "Editor");
                         ui.selectable_value(&mut self.settings.active_tab, SettingsTab::Permissions, "Permissions");
                         ui.selectable_value(&mut self.settings.active_tab, SettingsTab::APIs, "APIs");
+                        ui.selectable_value(&mut self.settings.active_tab, SettingsTab::About, "About");
+                        ui.selectable_value(&mut self.settings.active_tab, SettingsTab::License, "License");
                     });
                     ui.separator();
 
@@ -2423,6 +2453,17 @@ impl eframe::App for TypesafeApp {
                                 self.compilation_log.push_str("To clear cache manually, delete the tectonic cache directory in your user folder.\n");
                                 self.show_log = true;
                             }
+                        },
+                        SettingsTab::About => {
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                egui_commonmark::CommonMarkViewer::new("about_md_viewer")
+                                    .show(ui, &mut self.markdown_cache, self.readme_content);
+                            });
+                        },
+                        SettingsTab::License => {
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                ui.label(egui::RichText::new(self.license_content).monospace());
+                            });
                         }
                     }
                 });
