@@ -35,9 +35,9 @@ REM Populate target/release (Standalone Run Support)
 REM ------------------------------------------------------------------
 echo [INFO] Populating target/release for standalone running...
 
-if exist "deps\tectonic.exe" (
-    echo Copying tectonic.exe to target/release...
-    copy /y "deps\tectonic.exe" "target\release\" >nul
+if exist "deps\install-tl-windows.exe" (
+    echo Copying install-tl-windows.exe to target/release...
+    copy /y "deps\install-tl-windows.exe" "target\release\" >nul
 )
 if exist "deps\pdfium.dll" (
     echo Copying pdfium.dll to target/release...
@@ -67,7 +67,7 @@ mkdir "release_dist\web"
 
 echo Copying release files...
 copy /y "target\release\typesafe.exe" "release_dist\" >nul
-if exist "deps\tectonic.exe" copy /y "deps\tectonic.exe" "release_dist\" >nul
+if exist "deps\install-tl-windows.exe" copy /y "deps\install-tl-windows.exe" "release_dist\" >nul
 if exist "deps\pdfium.dll" copy /y "deps\pdfium.dll" "release_dist\" >nul
 if exist "dictionary.txt" copy /y "dictionary.txt" "release_dist\" >nul
 if exist "latex_data.json" copy /y "latex_data.json" "release_dist\" >nul

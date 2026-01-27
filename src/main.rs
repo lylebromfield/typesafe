@@ -1466,18 +1466,7 @@ impl TypesafeApp {
                     });
                 }
 
-                // Citations
-                if let Some(caps) = re_cite.captures(clean_line) {
-                    if let Some(c) = caps.get(1) {
-                        items.push(FlatItem {
-                            label: format!("Cite: {}", c.as_str()),
-                            file: display_path.clone(),
-                            line: line_idx,
-                            level: 4,
-                            kind: NodeKind::Citation,
-                        });
-                    }
-                }
+                // Citations - skip for outline (they clutter the panel)
 
                 if let Some(caps) = re_label.captures(clean_line) {
                     if let Some(l) = caps.get(1) { labels.push(l.as_str().to_string()); }
@@ -2224,13 +2213,16 @@ impl eframe::App for TypesafeApp {
             }
         }
 
-        // Command Palette Toggle / PDF Pop-out
+        // Command Palette Toggle
         if ctx.input(|i| i.key_pressed(egui::Key::P) && (i.modifiers.ctrl && i.modifiers.shift)) {
+            self.show_command_palette = !self.show_command_palette;
+            self.cmd_query.clear();
+        }
+
+        // PDF Pop-out (Ctrl+Alt+P)
+        if ctx.input(|i| i.key_pressed(egui::Key::P) && i.modifiers.ctrl && i.modifiers.alt) {
             if self.current_file_type == CurrentFileType::Pdf {
                 self.show_pdf_popup = !self.show_pdf_popup;
-            } else {
-                self.show_command_palette = !self.show_command_palette;
-                self.cmd_query.clear();
             }
         }
 
@@ -2426,6 +2418,13 @@ impl eframe::App for TypesafeApp {
                     if ui.add(egui::Button::new("Command Palette").shortcut_text("Ctrl+Shift+P")).clicked() {
                         self.show_command_palette = !self.show_command_palette;
                          ui.close_menu();
+                    }
+                    if self.current_file_type == CurrentFileType::Pdf {
+                        ui.separator();
+                        if ui.add(egui::Button::new("Pop-out PDF Viewer").shortcut_text("Ctrl+Alt+P")).clicked() {
+                            self.show_pdf_popup = true;
+                            ui.close_menu();
+                        }
                     }
                 });
 
@@ -2715,7 +2714,6 @@ impl eframe::App for TypesafeApp {
                         if ui.button("🖨").on_hover_text("Print").clicked() {
                             self.compilation_log.push_str("Print functionality not yet implemented\n");
                         }
-                    });
 
                     if self.show_pdf_search {
                         ui.horizontal(|ui| {
@@ -2965,7 +2963,8 @@ impl eframe::App for TypesafeApp {
                                         ui.label(egui::RichText::new(type_icon).color(egui::Color32::GRAY));
 
                                         if ui.button(egui::RichText::new(&node.label)).clicked() {
-                                            *jump_action = Some((node.file_path.clone(), node.line));
+                                            // Jump to line + 1 to account for 0-indexing in outline vs 1-indexing in editor
+                                            *jump_action = Some((node.file_path.clone(), node.line.saturating_sub(1)));
                                         }
                                     });
 
@@ -3000,6 +2999,7 @@ impl eframe::App for TypesafeApp {
                                     state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(char_idx))));
                                     state.store(ctx, egui::Id::new("main_editor"));
                                     ctx.memory_mut(|m| m.request_focus(egui::Id::new("main_editor")));
+                                    self.pending_cursor_scroll = Some(char_idx);
                                 }
                             }
 
@@ -3046,6 +3046,11 @@ impl eframe::App for TypesafeApp {
                             .color(theme.text_secondary)
                             .strong(),
                     );
+                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                         if ui.button("📤 Pop-out").on_hover_text("Open in separate window (Ctrl+Alt+P)").clicked() {
+                             self.show_pdf_popup = true;
+                         }
+                     });
                 });
                 ui.separator();
 
@@ -3506,7 +3511,6 @@ impl eframe::App for TypesafeApp {
                         if ui.button("🖨").on_hover_text("Print").clicked() {
                             self.compilation_log.push_str("Print functionality not yet implemented\n");
                         }
-                    });
 
                     if self.show_pdf_search {
                         ui.horizontal(|ui| {
@@ -3616,15 +3620,16 @@ impl eframe::App for TypesafeApp {
 
             // Search & Replace Bar
             if self.show_search {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
 
-                    // Search Input
-                    let search_resp = ui.add(egui::TextEdit::singleline(&mut self.search_query).desired_width(120.0).hint_text("Find..."));
-                    if search_resp.changed() {
-                        self.search_match_index = 0;
-                        // Perform search
-                        self.search_matches.clear();
+            // Search Input
+            let search_resp = ui.add(egui::TextEdit::singleline(&mut self.search_query).desired_width(120.0).hint_text("Find..."));
+            if search_resp.changed() {
+                self.search_match_index = 0;
+                self.checks_dirty = true;
+                // Perform search
+                self.search_matches.clear();
                         if !self.search_query.is_empty() {
                             let text = &self.editor_content;
                             let query = &self.search_query;
@@ -4101,42 +4106,43 @@ impl eframe::App for TypesafeApp {
                     }
 
                     // Paint line numbers
-                    {
-                        let galley = output.inner.galley.clone();
-                        let painter = ui.painter();
-                        let min_pos = response.rect.min - egui::vec2(gutter_width, 0.0);
+                            {
+                                let galley = output.inner.galley.clone();
+                                let painter = ui.painter();
+                                let min_pos = response.rect.min - egui::vec2(gutter_width, 0.0);
 
-                        // Paint gutter background
-                        let gutter_rect = egui::Rect::from_min_max(
-                            min_pos,
-                            egui::pos2(min_pos.x + gutter_width, response.rect.max.y)
-                        );
-                        painter.rect_filled(gutter_rect, 0.0, theme_clone.bg_tertiary);
+                                // Paint gutter background
+                                let gutter_rect = egui::Rect::from_min_max(
+                                    min_pos,
+                                    egui::pos2(min_pos.x + gutter_width, response.rect.max.y)
+                                );
+                                painter.rect_filled(gutter_rect, 0.0, theme_clone.bg_tertiary);
 
-                        let mut logical_line = 1;
-                        let mut start_new_line = true;
+                                let mut logical_line = 1;
+                                let mut start_new_line = true;
 
-                        for row in &galley.rows {
-                             if start_new_line {
-                                 let pos = min_pos + egui::vec2(0.0, row.rect.min.y - galley.rect.min.y);
-                                 painter.text(
-                                     pos + egui::vec2(gutter_width - 4.0, 0.0),
-                                     egui::Align2::RIGHT_TOP,
-                                     logical_line.to_string(),
-                                     egui::FontId::monospace(10.0),
-                                     theme_clone.text_secondary,
-                                 );
-                                 logical_line += 1;
-                             }
-                             start_new_line = row.ends_with_newline;
-                        }
-                    }
+                                for row in &galley.rows {
+                                     if start_new_line {
+                                         let pos = min_pos + egui::vec2(0.0, row.rect.min.y - galley.rect.min.y);
+                                         painter.text(
+                                             pos + egui::vec2(gutter_width - 4.0, 0.0),
+                                             egui::Align2::RIGHT_TOP,
+                                             logical_line.to_string(),
+                                             egui::FontId::monospace(10.0),
+                                             theme_clone.text_secondary,
+                                         );
+                                         logical_line += 1;
+                                     }
+                                     start_new_line = row.ends_with_newline;
+                                }
+                            }
 
-                    if response.changed() {
-                        self.editor_content = text.clone();
-                        self.is_dirty = true;
-                        self.last_edit_time = ctx.input(|i| i.time);
-                        self.checks_dirty = true;
+                            if response.changed() {
+                                self.editor_content = text.clone();
+                                self.is_dirty = true;
+                                self.last_edit_time = ctx.input(|i| i.time);
+                                self.checks_dirty = true;
+                                self.cached_spell_errors.clear();
 
                         // Autocomplete Trigger
                         if let Some(state) = egui::TextEdit::load_state(ctx, editor_id) {
