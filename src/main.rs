@@ -367,6 +367,14 @@ enum PdfFitMode {
     FitPage,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum CurrentFileType {
+    Tex,
+    Pdf,
+    Markdown,
+    Other,
+}
+
 #[derive(Clone, Debug)]
 struct Diagnostic {
     message: String,
@@ -597,6 +605,21 @@ struct TypesafeApp {
     readme_content: &'static str,
     license_content: &'static str,
     markdown_cache: egui_commonmark::CommonMarkCache,
+
+    // File type tracking
+    current_file_type: CurrentFileType,
+
+    // Pop-out PDF viewer
+    show_pdf_popup: bool,
+    pdf_popup_viewport_id: egui::ViewportId,
+
+    // PDF search
+    pdf_search_query: String,
+    show_pdf_search: bool,
+
+    // TeX Live management
+    texlive_install_prompted: bool,
+    use_texlive: bool,
 }
 
 impl Default for TypesafeApp {
@@ -879,6 +902,15 @@ impl Default for TypesafeApp {
             search_matches: Vec::new(),
             search_match_index: 0,
             last_save_time: 0.0,
+
+            current_file_type: CurrentFileType::Tex,
+            show_pdf_popup: false,
+            pdf_popup_viewport_id: egui::ViewportId::SELF,
+            pdf_search_query: String::new(),
+            show_pdf_search: false,
+
+            texlive_install_prompted: false,
+            use_texlive: true,
         };
 
         if !app.file_path.is_empty() && !app.file_path.ends_with("untitled.tex") {
@@ -1017,15 +1049,54 @@ impl TypesafeApp {
         }
     }
 
+    fn determine_file_type(path: &str) -> CurrentFileType {
+        let path_lower = path.to_lowercase();
+        if path_lower.ends_with(".pdf") {
+            CurrentFileType::Pdf
+        } else if path_lower.ends_with(".md") {
+            CurrentFileType::Markdown
+        } else if path_lower.ends_with(".tex") || path_lower.ends_with(".bib") || path_lower.ends_with(".cls") || path_lower.ends_with(".sty") {
+            CurrentFileType::Tex
+        } else {
+            CurrentFileType::Other
+        }
+    }
+
     fn load_file(&mut self, path: &str) {
-        match std::fs::read_to_string(path) {
-            Ok(contents) => {
-                self.editor_content = contents;
+        self.current_file_type = Self::determine_file_type(path);
+
+        match self.current_file_type {
+            CurrentFileType::Pdf => {
+                // Load PDF file directly
+                self.pdf_path = Some(std::path::PathBuf::from(path));
+                self.editor_content = "".to_string();
                 self.is_dirty = false;
-                self.compile();
+                // PDF will be loaded on next render when pdfium is available
             }
-            Err(e) => {
-                self.editor_content = format!("Error loading file: {}", e);
+            CurrentFileType::Markdown | CurrentFileType::Other => {
+                // Load text files normally
+                match std::fs::read_to_string(path) {
+                    Ok(contents) => {
+                        self.editor_content = contents;
+                        self.is_dirty = false;
+                    }
+                    Err(e) => {
+                        self.editor_content = format!("Error loading file: {}", e);
+                    }
+                }
+            }
+            CurrentFileType::Tex => {
+                // Load LaTeX files and compile
+                match std::fs::read_to_string(path) {
+                    Ok(contents) => {
+                        self.editor_content = contents;
+                        self.is_dirty = false;
+                        self.compile();
+                    }
+                    Err(e) => {
+                        self.editor_content = format!("Error loading file: {}", e);
+                    }
+                }
             }
         }
     }
@@ -1068,6 +1139,52 @@ impl TypesafeApp {
     }
 
     fn compile(&mut self) {
+        // Check if TeX Live is installed
+        if locate_texlive().is_none() {
+            self.texlive_install_prompted = true;
+
+            // Show dialog asking if user wants to install TeX Live
+            let confirmed = rfd::MessageDialog::new()
+                .set_title("TeX Live Required")
+                .set_description(
+                    "Typesafe requires TeX Live for LaTeX compilation.\n\n\
+                     TeX Live is not currently installed on your system.\n\n\
+                     Would you like to download and install TeX Live now?\n\n\
+                     This will download the TeX Live installer (~20 MB)."
+                )
+                .set_buttons(rfd::MessageButtons::YesNo)
+                .show();
+
+            if confirmed == rfd::MessageDialogResult::Yes {
+                if let Some(installer_path) = get_texlive_installer_path() {
+                    self.compilation_log = "Launching TeX Live installer...\n".to_string();
+
+                    #[cfg(windows)]
+                    {
+                        let _ = std::process::Command::new(&installer_path)
+                            .spawn();
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        // On Unix, extract if needed and show instructions
+                        let parent = installer_path.parent().unwrap_or(std::path::Path::new("."));
+                        self.compilation_log.push_str(&format!(
+                            "TeX Live installer found at: {}\n\
+                             Please run it manually to complete installation.\n",
+                            installer_path.display()
+                        ));
+                    }
+                    return;
+                } else {
+                    self.compilation_log = "ERROR: TeX Live installer not found. Please reinstall Typesafe.\n".to_string();
+                    return;
+                }
+            } else {
+                self.compilation_log = "TeX Live is required for compilation. Installation cancelled.\n".to_string();
+                return;
+            }
+        }
+
         if self.settings.autosave_on_compile && self.is_dirty {
             if !self.file_path.is_empty() && self.file_path != "untitled.tex" && !self.file_path.ends_with("untitled.tex") {
                  let _ = std::fs::write(&self.file_path, &self.editor_content);
@@ -1101,19 +1218,51 @@ impl TypesafeApp {
                 return;
             }
 
-            let tectonic = locate_tectonic();
-            let mut cmd = Command::new(&tectonic);
+            // Use pdflatex from TeX Live
+            let pdflatex = if let Some(path) = locate_texlive() {
+                if cfg!(windows) {
+                    format!("{}\\pdflatex.exe", path)
+                } else {
+                    format!("{}/pdflatex", path)
+                }
+            } else {
+                "pdflatex".to_string()
+            };
+
+            let mut cmd = Command::new(&pdflatex);
             // Determine output dir
             let parent_dir = std::path::Path::new(&target_path).parent().unwrap_or(std::path::Path::new("."));
             let file_name = std::path::Path::new(&target_path).file_name().unwrap_or_default().to_string_lossy().to_string();
 
+            // Run pdflatex with appropriate flags
             cmd.current_dir(parent_dir)
-                .arg("-X")
-                .arg("compile")
-                .arg("--synctex")
-                .arg(file_name)
+                .arg("-interaction=nonstopmode")
+                .arg("-synctex=1")
+                .arg(&file_name)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
+
+            // If document uses biblatex, run biber first
+            if content.contains("\\usepackage{biblatex}") {
+                let biber = if let Some(path) = locate_texlive() {
+                    if cfg!(windows) {
+                        format!("{}\\biber.exe", path)
+                    } else {
+                        format!("{}/biber", path)
+                    }
+                } else {
+                    "biber".to_string()
+                };
+
+                let stem = std::path::Path::new(&file_name).file_stem().unwrap_or_default().to_string_lossy();
+                let mut biber_cmd = Command::new(&biber);
+                biber_cmd.current_dir(parent_dir)
+                    .arg(stem.as_ref())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+
+                let _ = biber_cmd.output();
+            }
 
             #[cfg(windows)]
             {
@@ -1130,8 +1279,8 @@ impl TypesafeApp {
                 let mut diagnostics = Vec::new();
                 // Regex to find "l.123 context" pattern commonly output by TeX engines
                 let tex_regex = regex::Regex::new(r"l\.(\d+)\s+(.*)").unwrap();
-                // Regex to find "error: file.tex:123: message" pattern output by Tectonic
-                let tectonic_regex = regex::Regex::new(r"error: .+:(\d+): (.*)").unwrap();
+                // Regex to find "error: file.tex:123: message" pattern output by pdflatex
+                let pdflatex_regex = regex::Regex::new(r"error: .+:(\d+): (.*)").unwrap();
 
                 for line in stdout.lines().chain(stderr.lines()) {
                     if let Some(caps) = tex_regex.captures(line) {
@@ -1142,7 +1291,7 @@ impl TypesafeApp {
                                 file: target_path.clone(),
                             });
                         }
-                    } else if let Some(caps) = tectonic_regex.captures(line) {
+                    } else if let Some(caps) = pdflatex_regex.captures(line) {
                          if let Ok(line_num) = caps[1].parse::<usize>() {
                             diagnostics.push(Diagnostic {
                                 line: line_num,
@@ -1182,7 +1331,7 @@ impl TypesafeApp {
                     )));
                 }
                 Err(e) => {
-                    let _ = tx.send(CompilationMsg::Error(format!("Failed to run tectonic: {}", e)));
+                    let _ = tx.send(CompilationMsg::Error(format!("Failed to run pdflatex: {}", e)));
                 }
             }
         });
@@ -1899,6 +2048,15 @@ impl eframe::App for TypesafeApp {
             self.compile();
         }
 
+        // Load PDF if needed
+        if self.current_file_type == CurrentFileType::Pdf && self.pdf_path.is_some() && self.pdfium.is_some() {
+            if self.page_count == 0 {
+                if let Some(pdf_path) = &self.pdf_path.clone() {
+                    self.load_pdf_preview(ctx, pdf_path);
+                }
+            }
+        }
+
         let now = ctx.input(|i| i.time);
         if self.settings.autosave_timer && self.is_dirty {
             if now - self.last_save_time > 30.0 {
@@ -2047,25 +2205,33 @@ impl eframe::App for TypesafeApp {
         if ctx.input(|i| {
             i.key_pressed(egui::Key::B) && (i.modifiers.ctrl || i.modifiers.command)
         }) {
-            if !self.is_compiling {
+            if self.current_file_type == CurrentFileType::Tex && !self.is_compiling {
                 self.compile();
             }
         }
 
         // Search Toggle
         if ctx.input(|i| i.key_pressed(egui::Key::F) && (i.modifiers.ctrl || i.modifiers.command)) {
-            self.show_search = !self.show_search;
-            if self.show_search {
-                // Focus handled by UI render
+            if self.current_file_type == CurrentFileType::Pdf {
+                self.show_pdf_search = !self.show_pdf_search;
             } else {
-                self.search_matches.clear();
+                self.show_search = !self.show_search;
+                if self.show_search {
+                    // Focus handled by UI render
+                } else {
+                    self.search_matches.clear();
+                }
             }
         }
 
-        // Command Palette Toggle
+        // Command Palette Toggle / PDF Pop-out
         if ctx.input(|i| i.key_pressed(egui::Key::P) && (i.modifiers.ctrl && i.modifiers.shift)) {
-            self.show_command_palette = !self.show_command_palette;
-            self.cmd_query.clear();
+            if self.current_file_type == CurrentFileType::Pdf {
+                self.show_pdf_popup = !self.show_pdf_popup;
+            } else {
+                self.show_command_palette = !self.show_command_palette;
+                self.cmd_query.clear();
+            }
         }
 
         // ====== TOP PANEL ======
@@ -2442,7 +2608,7 @@ impl eframe::App for TypesafeApp {
                             }
                         },
                         SettingsTab::APIs => {
-                            ui.heading("Tectonic Engine");
+                            ui.heading("TeX Live Engine");
                             ui.add_space(4.0);
                             if ui.checkbox(&mut self.settings.auto_compile, "Auto-compile on Save").changed() {
                                 self.settings.save();
@@ -2450,7 +2616,7 @@ impl eframe::App for TypesafeApp {
                             ui.add_space(8.0);
                             if ui.button("🗑 Clear Package Cache").clicked() {
                                 // Placeholder for clearing cache logic
-                                self.compilation_log.push_str("To clear cache manually, delete the tectonic cache directory in your user folder.\n");
+                                self.compilation_log.push_str("To clear cache manually, delete the TeX Live cache directory in your user folder.\n");
                                 self.show_log = true;
                             }
                         },
@@ -2469,6 +2635,137 @@ impl eframe::App for TypesafeApp {
                 });
         }
         self.settings.show_settings_window = show_settings;
+
+        // ====== POP-OUT PDF VIEWER WINDOW ======
+        if self.show_pdf_popup && self.current_file_type == CurrentFileType::Pdf && self.pdf_path.is_some() {
+            let mut show_popup = true;
+            egui::Window::new("PDF Viewer")
+                .open(&mut show_popup)
+                .default_size([900.0, 700.0])
+                .vscroll(false)
+                .hscroll(false)
+                .show(ctx, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+
+                        if ui.button("◀").on_hover_text("Previous Page").clicked() && self.current_page > 0 {
+                            self.current_page -= 1;
+                        }
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{}/{}",
+                                self.current_page + 1,
+                                self.page_count.max(1)
+                            ))
+                            .color(theme.text_secondary)
+                            .strong(),
+                        );
+                        if ui.button("▶").on_hover_text("Next Page").clicked() && self.current_page + 1 < self.page_count {
+                            self.current_page += 1;
+                        }
+
+                        ui.separator();
+
+                        let mut zoom = self.zoom;
+                        if ui.button("➖").clicked() {
+                            zoom = (zoom - 0.1).clamp(0.1, 5.0);
+                            self.fit_mode = PdfFitMode::Normal;
+                        }
+                        if ui.add(egui::Slider::new(&mut zoom, 0.1..=5.0).step_by(0.05).show_value(false)).changed() {
+                            self.fit_mode = PdfFitMode::Normal;
+                        }
+                        if ui.button("➕").clicked() {
+                            zoom = (zoom + 0.1).clamp(0.1, 5.0);
+                            self.fit_mode = PdfFitMode::Normal;
+                        }
+
+                        let mut zoom_percent = (zoom * 100.0).round() as u32;
+                        if ui.add(egui::DragValue::new(&mut zoom_percent).suffix("%").clamp_range(10..=500).speed(1.0)).changed() {
+                            zoom = zoom_percent as f32 / 100.0;
+                            self.fit_mode = PdfFitMode::Normal;
+                        }
+
+                        if (zoom - self.zoom).abs() > 0.001 {
+                            self.zoom = zoom;
+                            self.pdf_textures.clear();
+                        }
+
+                        if ui.button("⟳").on_hover_text("Reset Zoom").clicked() {
+                            self.zoom = 1.0;
+                            self.fit_mode = PdfFitMode::Normal;
+                            self.pdf_textures.clear();
+                        }
+
+                        ui.separator();
+
+                        if ui.button("↔").on_hover_text("Fit Width").clicked() {
+                            self.fit_mode = PdfFitMode::FitWidth;
+                            self.pdf_textures.clear();
+                        }
+                        if ui.button("⬚").on_hover_text("Fit Page").clicked() {
+                            self.fit_mode = PdfFitMode::FitPage;
+                            self.pdf_textures.clear();
+                        }
+
+                        ui.separator();
+
+                        if ui.button("🔍").on_hover_text("Search (Ctrl+F)").clicked() {
+                            self.show_pdf_search = !self.show_pdf_search;
+                        }
+                        if ui.button("🖨").on_hover_text("Print").clicked() {
+                            self.compilation_log.push_str("Print functionality not yet implemented\n");
+                        }
+                    });
+
+                    if self.show_pdf_search {
+                        ui.horizontal(|ui| {
+                            ui.label("Search:");
+                            ui.text_edit_singleline(&mut self.pdf_search_query);
+                            if ui.button("✖").clicked() {
+                                self.show_pdf_search = false;
+                                self.pdf_search_query.clear();
+                            }
+                        });
+                    }
+
+                    ui.separator();
+
+                    let scroll_zoom = ctx.input(|i| if i.modifiers.ctrl { i.raw_scroll_delta.y } else { 0.0 });
+                    if scroll_zoom.abs() > 0.0 {
+                        self.zoom = (self.zoom + scroll_zoom * 0.0015).clamp(0.3, 4.0);
+                        self.pdf_textures.clear();
+                    }
+
+                    egui::ScrollArea::both()
+                        .id_source("pdf_popup_scroll")
+                        .show(ui, |ui| {
+                            ui.vertical_centered(|ui| {
+                                if self.page_count > 0 {
+                                    for page_idx in 0..self.page_count {
+                                        self.render_page(ctx, page_idx);
+
+                                        if let Some(tex) = self.pdf_textures.get(&page_idx) {
+                                            if let Some([w, h]) = self.preview_size {
+                                                let aspect = w as f32 / h as f32;
+                                                let available_w = (ui.available_width() - 20.0).max(100.0);
+                                                let display_width = available_w * self.zoom;
+                                                let display_height = display_width / aspect;
+
+                                                ui.add(egui::Image::new((
+                                                    tex.id(),
+                                                    Vec2::new(display_width, display_height),
+                                                )).sense(egui::Sense::click()));
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    ui.label("No PDF loaded");
+                                }
+                            });
+                        });
+                });
+            self.show_pdf_popup = show_popup;
+        }
 
         // ====== LEFT PANEL (FILES) ======
         if self.show_file_panel {
@@ -2610,13 +2907,15 @@ impl eframe::App for TypesafeApp {
                                         if is_dir {
                                             self.current_dir = path;
                                         } else if is_allowed {
-                                            if ["tex", "bib", "cls", "sty", "md", "txt"].contains(&ext.as_str()) {
+                                            if ["tex", "bib", "cls", "sty", "md", "txt", "pdf"].contains(&ext.as_str()) {
                                                 self.file_path = path.to_string_lossy().to_string();
                                                 let path_str = self.file_path.clone();
                                                 self.load_file(&path_str);
                                                 self.settings.last_file = Some(self.file_path.clone());
                                                 self.settings.save();
-                                                self.update_outline();
+                                                if self.current_file_type == CurrentFileType::Tex {
+                                                    self.update_outline();
+                                                }
                                             }
                                         }
                                     }
@@ -2725,7 +3024,8 @@ impl eframe::App for TypesafeApp {
         }
 
         // ====== RIGHT PANEL (PREVIEW) ======
-        if self.show_preview_panel {
+        // Hide preview panel for PDF files (they use central panel) and Markdown files
+        if self.show_preview_panel && self.current_file_type == CurrentFileType::Tex {
         let files_gap = if self.show_file_panel { 250.0 } else { 40.0 };
         let min_editor_width = 720.0;
         let max_preview_w = (ctx.screen_rect().width() - files_gap - min_editor_width).max(300.0);
@@ -3116,23 +3416,175 @@ impl eframe::App for TypesafeApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
-        // ====== CENTRAL PANEL (EDITOR) ======
+        // ====== CENTRAL PANEL (EDITOR OR PDF VIEWER) ======
         egui::CentralPanel::default().show(ctx, |ui| {
+            // Show different content based on file type
+            match self.current_file_type {
+                CurrentFileType::Pdf => {
+                    // Show PDF preview in full editor area
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("PDF VIEWER")
+                                .color(theme.text_secondary)
+                                .strong(),
+                        );
+                        if ui.button("📤 Pop-out").on_hover_text("Open in separate window (Ctrl+Shift+P)").clicked() {
+                            self.show_pdf_popup = true;
+                        }
+                    });
+                    ui.separator();
+
+                    // PDF Controls
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+
+                        if ui.button("◀").on_hover_text("Previous Page").clicked() && self.current_page > 0 {
+                            self.current_page -= 1;
+                        }
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{}/{}",
+                                self.current_page + 1,
+                                self.page_count.max(1)
+                            ))
+                            .color(theme.text_secondary)
+                            .strong(),
+                        );
+                        if ui.button("▶").on_hover_text("Next Page").clicked() && self.current_page + 1 < self.page_count {
+                            self.current_page += 1;
+                        }
+
+                        ui.separator();
+
+                        let mut zoom = self.zoom;
+                        if ui.button("➖").clicked() {
+                            zoom = (zoom - 0.1).clamp(0.1, 5.0);
+                            self.fit_mode = PdfFitMode::Normal;
+                        }
+                        if ui.add(egui::Slider::new(&mut zoom, 0.1..=5.0).step_by(0.05).show_value(false)).changed() {
+                            self.fit_mode = PdfFitMode::Normal;
+                        }
+                        if ui.button("➕").clicked() {
+                            zoom = (zoom + 0.1).clamp(0.1, 5.0);
+                            self.fit_mode = PdfFitMode::Normal;
+                        }
+
+                        let mut zoom_percent = (zoom * 100.0).round() as u32;
+                        if ui.add(egui::DragValue::new(&mut zoom_percent).suffix("%").clamp_range(10..=500).speed(1.0)).changed() {
+                            zoom = zoom_percent as f32 / 100.0;
+                            self.fit_mode = PdfFitMode::Normal;
+                        }
+
+                        if (zoom - self.zoom).abs() > 0.001 {
+                            self.zoom = zoom;
+                            self.pdf_textures.clear();
+                        }
+
+                        if ui.button("⟳").on_hover_text("Reset Zoom").clicked() {
+                            self.zoom = 1.0;
+                            self.fit_mode = PdfFitMode::Normal;
+                            self.pdf_textures.clear();
+                        }
+
+                        ui.separator();
+
+                        if ui.button("↔").on_hover_text("Fit Width").clicked() {
+                            self.fit_mode = PdfFitMode::FitWidth;
+                            self.pdf_textures.clear();
+                        }
+                        if ui.button("⬚").on_hover_text("Fit Page").clicked() {
+                            self.fit_mode = PdfFitMode::FitPage;
+                            self.pdf_textures.clear();
+                        }
+
+                        ui.separator();
+
+                        if ui.button("🔍").on_hover_text("Search (Ctrl+F)").clicked() {
+                            self.show_pdf_search = !self.show_pdf_search;
+                        }
+                        if ui.button("🖨").on_hover_text("Print").clicked() {
+                            self.compilation_log.push_str("Print functionality not yet implemented\n");
+                        }
+                    });
+
+                    if self.show_pdf_search {
+                        ui.horizontal(|ui| {
+                            ui.label("Search:");
+                            ui.text_edit_singleline(&mut self.pdf_search_query);
+                            if ui.button("✖").clicked() {
+                                self.show_pdf_search = false;
+                                self.pdf_search_query.clear();
+                            }
+                        });
+                        ui.separator();
+                    }
+
+                    // Display PDF
+                    let scroll_zoom = ctx.input(|i| if i.modifiers.ctrl { i.raw_scroll_delta.y } else { 0.0 });
+                    if scroll_zoom.abs() > 0.0 {
+                        self.zoom = (self.zoom + scroll_zoom * 0.0015).clamp(0.3, 4.0);
+                        self.pdf_textures.clear();
+                    }
+
+                    egui::ScrollArea::both()
+                        .id_source("pdf_central_scroll")
+                        .show(ui, |ui| {
+                            ui.vertical_centered(|ui| {
+                                if self.page_count > 0 {
+                                    for page_idx in 0..self.page_count {
+                                        self.render_page(ctx, page_idx);
+
+                                        if let Some(tex) = self.pdf_textures.get(&page_idx) {
+                                            if let Some([w, h]) = self.preview_size {
+                                                let aspect = w as f32 / h as f32;
+                                                let available_w = (ui.available_width() - 20.0).max(100.0);
+                                                let display_width = available_w * self.zoom;
+                                                let display_height = display_width / aspect;
+
+                                                ui.add(egui::Image::new((
+                                                    tex.id(),
+                                                    Vec2::new(display_width, display_height),
+                                                )).sense(egui::Sense::click()));
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    ui.label("No PDF loaded");
+                                }
+                            });
+                        });
+                    return;
+                }
+                CurrentFileType::Markdown => {
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("MARKDOWN PREVIEW")
+                                .color(theme.text_secondary)
+                                .strong(),
+                        );
+                    });
+                    ui.separator();
+
+                    egui::ScrollArea::both().show(ui, |ui| {
+                        egui_commonmark::CommonMarkViewer::new("markdown_viewer")
+                            .show(ui, &mut self.markdown_cache, &self.editor_content);
+                    });
+
+                    ui.separator();
+                    ui.label(egui::RichText::new("⚠ PDF preview not available for Markdown files").italics().color(theme.warning));
+                    return;
+                }
+                _ => {} // Continue with normal editor for .tex files
+            }
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("✏ EDITOR")
+                    egui::RichText::new("EDITOR")
                         .color(theme.text_secondary)
                         .strong(),
                 );
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.button("⚡ Compile (Ctrl+B)").clicked() && !self.is_compiling {
-                        self.compile();
-                    }
-                    if ui.button("💾 Save (Ctrl+S)").clicked() {
-                        self.save_file(true);
-                    }
-                });
             });
             ui.separator();
 
@@ -4121,41 +4573,64 @@ fn ensure_fontconfig() {
     }
 }
 
-fn locate_tectonic() -> String {
-    let exe_name = if cfg!(windows) { "tectonic.exe" } else { "tectonic" };
+fn locate_texlive() -> Option<String> {
+    // 1. Try to find pdflatex in PATH
+    let pdflatex_name = if cfg!(windows) { "pdflatex.exe" } else { "pdflatex" };
+    let output = std::process::Command::new("which")
+        .arg(pdflatex_name)
+        .output();
 
-    // 1. Check next to the executable (Deployment / Standalone)
-    if let Ok(current_exe) = std::env::current_exe() {
-        if let Some(parent) = current_exe.parent() {
-            let candidate = parent.join(exe_name);
-            if candidate.exists() {
-                return candidate.to_string_lossy().into_owned();
-            }
-            // Check deps folder relative to executable
-            let candidate_deps = parent.join("deps").join(exe_name);
-            if candidate_deps.exists() {
-                 return candidate_deps.to_string_lossy().into_owned();
-            }
-
-            // Check root deps relative to target/release (../../deps)
-            let candidate_root_deps = parent.join("../../deps").join(exe_name);
-            if candidate_root_deps.exists() {
-                return candidate_root_deps.to_string_lossy().into_owned();
+    if let Ok(output) = output {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                return Some(path);
             }
         }
     }
 
-    // 2. Check CWD (Development / mixed)
-    if std::path::Path::new(exe_name).exists() {
-        return exe_name.to_string();
-    }
-    let deps_exe = std::path::Path::new("deps").join(exe_name);
-    if deps_exe.exists() {
-        return deps_exe.to_string_lossy().into_owned();
+    // 2. Check common TeX Live installation paths on Windows
+    if cfg!(windows) {
+        let common_paths = vec![
+            "C:\\texlive\\2024\\bin\\windows",
+            "C:\\texlive\\2023\\bin\\windows",
+            "C:\\texlive\\2022\\bin\\windows",
+            "C:\\Program Files\\texlive\\2024\\bin\\windows",
+        ];
+        for path in common_paths {
+            if std::path::Path::new(path).exists() {
+                return Some(path.to_string());
+            }
+        }
     }
 
-    // 3. Fallback to PATH
-    exe_name.to_string()
+    None
+}
+
+fn get_texlive_installer_path() -> Option<std::path::PathBuf> {
+    let installer_name = if cfg!(windows) { "install-tl-windows.exe" } else { "install-tl-unx.tar.gz" };
+
+    // 1. Check next to the executable
+    if let Ok(current_exe) = std::env::current_exe() {
+        if let Some(parent) = current_exe.parent() {
+            let candidate = parent.join(installer_name);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+            let candidate_deps = parent.join("deps").join(installer_name);
+            if candidate_deps.exists() {
+                return Some(candidate_deps);
+            }
+        }
+    }
+
+    // 2. Check in deps folder from CWD
+    let deps_candidate = std::path::Path::new("deps").join(installer_name);
+    if deps_candidate.exists() {
+        return Some(deps_candidate);
+    }
+
+    None
 }
 
 fn render_pdf_page_to_texture(
