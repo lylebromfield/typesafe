@@ -31,6 +31,29 @@ if not exist "target\release\typesafe.exe" (
 )
 
 REM ------------------------------------------------------------------
+REM Code Sign the Executable (Optional - requires certificate)
+REM ------------------------------------------------------------------
+if exist "typesafe.pfx" (
+    echo [INFO] Signing executable...
+    REM Set CODE_SIGN_PASSWORD environment variable before running this script
+    REM Example: set CODE_SIGN_PASSWORD=your_certificate_password
+    if defined CODE_SIGN_PASSWORD (
+        signtool sign /f typesafe.pfx /p "%CODE_SIGN_PASSWORD%" /fd SHA256 /tr http://timestamp.sectigo.com /td SHA256 "target\release\typesafe.exe"
+        if %errorlevel% neq 0 (
+            echo [WARNING] Code signing failed. Continuing without signature.
+        ) else (
+            echo [SUCCESS] Executable signed successfully.
+        )
+    ) else (
+        echo [WARNING] CODE_SIGN_PASSWORD not set. Skipping code signing.
+        echo [INFO] To enable signing, set: set CODE_SIGN_PASSWORD=your_password
+    )
+) else (
+    echo [INFO] No code-signing certificate found (typesafe.pfx). Skipping signing.
+    echo [INFO] See SIGNING_GUIDE.md for instructions on obtaining and using a certificate.
+)
+
+REM ------------------------------------------------------------------
 REM Populate target/release (Standalone Run Support)
 REM ------------------------------------------------------------------
 echo [INFO] Populating target/release for standalone running...

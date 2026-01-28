@@ -4476,6 +4476,29 @@ impl eframe::App for TypesafeApp {
                         self.completion_popup_rect = Some(frame_resp.response.rect);
                     });
 
+                // Handle keyboard navigation and selection
+                if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+                    if self.completion_selected_index > 0 {
+                        self.completion_selected_index -= 1;
+                    }
+                }
+                if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+                    if self.completion_selected_index < self.completion_suggestions.len() - 1 {
+                        self.completion_selected_index += 1;
+                    }
+                }
+                if ctx.input(|i| (i.key_pressed(egui::Key::Space) && i.modifiers.ctrl) || i.key_pressed(egui::Key::Tab)) {
+                    if self.completion_selected_index < self.completion_suggestions.len() {
+                        let (_, completion) = self.completion_suggestions[self.completion_selected_index].clone();
+                        let mut text = self.editor_content.clone();
+                        self.apply_completion(ctx, &mut text, &completion);
+                        self.editor_content = text;
+                        self.show_completions = false;
+                        self.completion_suggestions.clear();
+                        self.completion_selected_index = 0;
+                    }
+                }
+
                 // Close popup on Escape or click outside
                 let close_on_click = if let Some(rect) = self.completion_popup_rect {
                     ctx.input(|i| i.pointer.any_click() && !rect.contains(i.pointer.hover_pos().unwrap_or_default()))
