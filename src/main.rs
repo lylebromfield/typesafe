@@ -481,6 +481,7 @@ enum NodeKind {
     Figure,
     Table,
     Theorem,
+    #[allow(dead_code)]
     Citation,
     Unknown,
 }
@@ -617,9 +618,10 @@ struct TypesafeApp {
     pdf_search_query: String,
     show_pdf_search: bool,
 
-    // TeX Live management
-    texlive_install_prompted: bool,
-    use_texlive: bool,
+    // File Management
+    rename_dialog_open: bool,
+    rename_target_path: std::path::PathBuf,
+    rename_new_name: String,
 }
 
 impl Default for TypesafeApp {
@@ -905,12 +907,13 @@ impl Default for TypesafeApp {
 
             current_file_type: CurrentFileType::Tex,
             show_pdf_popup: false,
-            pdf_popup_viewport_id: egui::ViewportId::SELF,
+            pdf_popup_viewport_id: egui::ViewportId::ROOT,
             pdf_search_query: String::new(),
             show_pdf_search: false,
 
-            texlive_install_prompted: false,
-            use_texlive: true,
+            rename_dialog_open: false,
+            rename_target_path: std::path::PathBuf::new(),
+            rename_new_name: String::new(),
         };
 
         if !app.file_path.is_empty() && !app.file_path.ends_with("untitled.tex") {
@@ -1139,52 +1142,6 @@ impl TypesafeApp {
     }
 
     fn compile(&mut self) {
-        // Check if TeX Live is installed
-        if locate_texlive().is_none() {
-            self.texlive_install_prompted = true;
-
-            // Show dialog asking if user wants to install TeX Live
-            let confirmed = rfd::MessageDialog::new()
-                .set_title("TeX Live Required")
-                .set_description(
-                    "Typesafe requires TeX Live for LaTeX compilation.\n\n\
-                     TeX Live is not currently installed on your system.\n\n\
-                     Would you like to download and install TeX Live now?\n\n\
-                     This will download the TeX Live installer (~20 MB)."
-                )
-                .set_buttons(rfd::MessageButtons::YesNo)
-                .show();
-
-            if confirmed == rfd::MessageDialogResult::Yes {
-                if let Some(installer_path) = get_texlive_installer_path() {
-                    self.compilation_log = "Launching TeX Live installer...\n".to_string();
-
-                    #[cfg(windows)]
-                    {
-                        let _ = std::process::Command::new(&installer_path)
-                            .spawn();
-                    }
-                    #[cfg(not(windows))]
-                    {
-                        // On Unix, extract if needed and show instructions
-                        let parent = installer_path.parent().unwrap_or(std::path::Path::new("."));
-                        self.compilation_log.push_str(&format!(
-                            "TeX Live installer found at: {}\n\
-                             Please run it manually to complete installation.\n",
-                            installer_path.display()
-                        ));
-                    }
-                    return;
-                } else {
-                    self.compilation_log = "ERROR: TeX Live installer not found. Please reinstall Typesafe.\n".to_string();
-                    return;
-                }
-            } else {
-                self.compilation_log = "TeX Live is required for compilation. Installation cancelled.\n".to_string();
-                return;
-            }
-        }
-
         if self.settings.autosave_on_compile && self.is_dirty {
             if !self.file_path.is_empty() && self.file_path != "untitled.tex" && !self.file_path.ends_with("untitled.tex") {
                  let _ = std::fs::write(&self.file_path, &self.editor_content);
@@ -1218,51 +1175,43 @@ impl TypesafeApp {
                 return;
             }
 
-            // Use pdflatex from TeX Live
-            let pdflatex = if let Some(path) = locate_texlive() {
-                if cfg!(windows) {
-                    format!("{}\\pdflatex.exe", path)
-                } else {
-                    format!("{}/pdflatex", path)
-                }
-            } else {
-                "pdflatex".to_string()
-            };
+            // Locate tectonic binary
+            let tectonic_name = if cfg!(windows) { "tectonic.exe" } else { "tectonic" };
+            let mut tectonic_path = std::path::PathBuf::from(tectonic_name);
 
-            let mut cmd = Command::new(&pdflatex);
+            if let Ok(current_exe) = std::env::current_exe() {
+                if let Some(parent) = current_exe.parent() {
+                    let candidate = parent.join(tectonic_name);
+                    if candidate.exists() {
+                        tectonic_path = candidate;
+                    } else {
+                        let candidate_deps = parent.join("deps").join(tectonic_name);
+                        if candidate_deps.exists() {
+                            tectonic_path = candidate_deps;
+                        } else if let Some(target_dir) = parent.parent() {
+                            if let Some(project_root) = target_dir.parent() {
+                                let dev_candidate = project_root.join("deps").join(tectonic_name);
+                                if dev_candidate.exists() {
+                                    tectonic_path = dev_candidate;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // Determine output dir
             let parent_dir = std::path::Path::new(&target_path).parent().unwrap_or(std::path::Path::new("."));
-            let file_name = std::path::Path::new(&target_path).file_name().unwrap_or_default().to_string_lossy().to_string();
 
-            // Run pdflatex with appropriate flags
+            let mut cmd = Command::new(tectonic_path);
             cmd.current_dir(parent_dir)
-                .arg("-interaction=nonstopmode")
-                .arg("-synctex=1")
-                .arg(&file_name)
+                .arg("-X")
+                .arg("compile")
+                .arg(&target_path)
+                .arg("--synctex")
+                .arg("--keep-intermediates")
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
-
-            // If document uses biblatex, run biber first
-            if content.contains("\\usepackage{biblatex}") {
-                let biber = if let Some(path) = locate_texlive() {
-                    if cfg!(windows) {
-                        format!("{}\\biber.exe", path)
-                    } else {
-                        format!("{}/biber", path)
-                    }
-                } else {
-                    "biber".to_string()
-                };
-
-                let stem = std::path::Path::new(&file_name).file_stem().unwrap_or_default().to_string_lossy();
-                let mut biber_cmd = Command::new(&biber);
-                biber_cmd.current_dir(parent_dir)
-                    .arg(stem.as_ref())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
-
-                let _ = biber_cmd.output();
-            }
 
             #[cfg(windows)]
             {
@@ -1271,28 +1220,19 @@ impl TypesafeApp {
                 cmd.creation_flags(CREATE_NO_WINDOW);
             }
 
+            let _ = tx.send(CompilationMsg::Log("Running tectonic...".to_string()));
             let output = cmd.output();
 
             if let Ok(out) = &output {
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 let mut diagnostics = Vec::new();
-                // Regex to find "l.123 context" pattern commonly output by TeX engines
-                let tex_regex = regex::Regex::new(r"l\.(\d+)\s+(.*)").unwrap();
-                // Regex to find "error: file.tex:123: message" pattern output by pdflatex
-                let pdflatex_regex = regex::Regex::new(r"error: .+:(\d+): (.*)").unwrap();
+                // Tectonic output parsing
+                let error_regex = regex::Regex::new(r"error: .+:(\d+): (.*)").unwrap();
 
                 for line in stdout.lines().chain(stderr.lines()) {
-                    if let Some(caps) = tex_regex.captures(line) {
+                    if let Some(caps) = error_regex.captures(line) {
                         if let Ok(line_num) = caps[1].parse::<usize>() {
-                            diagnostics.push(Diagnostic {
-                                line: line_num,
-                                message: caps[2].to_string(),
-                                file: target_path.clone(),
-                            });
-                        }
-                    } else if let Some(caps) = pdflatex_regex.captures(line) {
-                         if let Ok(line_num) = caps[1].parse::<usize>() {
                             diagnostics.push(Diagnostic {
                                 line: line_num,
                                 message: caps[2].to_string(),
@@ -1331,7 +1271,7 @@ impl TypesafeApp {
                     )));
                 }
                 Err(e) => {
-                    let _ = tx.send(CompilationMsg::Error(format!("Failed to run pdflatex: {}", e)));
+                    let _ = tx.send(CompilationMsg::Error(format!("Failed to run tectonic: {}", e)));
                 }
             }
         });
@@ -1412,7 +1352,7 @@ impl TypesafeApp {
             // New regexes for Semantic Blocks
             let re_env = regex::Regex::new(r"\\begin\{(figure|table|theorem|lemma|definition)\}(?:\[.*\])?").unwrap();
             let re_caption = regex::Regex::new(r"\\caption\{([^}]+)\}").unwrap();
-            let re_cite = regex::Regex::new(r"\\cite\{([^}]+)\}").unwrap();
+            let _re_cite = regex::Regex::new(r"\\cite\{([^}]+)\}").unwrap();
 
             for (line_idx, line) in content.lines().enumerate() {
                 let clean_line = if let Some(idx) = line.find('%') { &line[..idx] } else { line };
@@ -1508,14 +1448,15 @@ impl TypesafeApp {
         self.outline_nodes = roots;
         self.labels = all_labels;
 
-        // Scan bibliography (naive: scan all .bib in current dir)
+        // Scan bibliography using biblatex parser
         if let Ok(entries) = std::fs::read_dir(&self.current_dir) {
             for entry in entries.flatten() {
                  if entry.path().extension().map_or(false, |e| e == "bib") {
                     if let Ok(c) = std::fs::read_to_string(entry.path()) {
-                        let re = regex::Regex::new(r"@\w+\{([^,]+),").unwrap();
-                        for cap in re.captures_iter(&c) {
-                            if let Some(k) = cap.get(1) { self.bib_items.push(k.as_str().to_string()); }
+                        if let Ok(bibliography) = biblatex::Bibliography::parse(&c) {
+                            for entry in bibliography {
+                                self.bib_items.push(entry.key);
+                            }
                         }
                     }
                  }
@@ -2419,10 +2360,11 @@ impl eframe::App for TypesafeApp {
                         self.show_command_palette = !self.show_command_palette;
                          ui.close_menu();
                     }
-                    if self.current_file_type == CurrentFileType::Pdf {
+                    if self.pdf_path.is_some() {
                         ui.separator();
                         if ui.add(egui::Button::new("Pop-out PDF Viewer").shortcut_text("Ctrl+Alt+P")).clicked() {
                             self.show_pdf_popup = true;
+                            self.pdf_textures.clear();
                             ui.close_menu();
                         }
                     }
@@ -2481,6 +2423,20 @@ impl eframe::App for TypesafeApp {
                         ui.close_menu();
                     }
                 });
+
+                ui.separator();
+                if ui.button("💾 Save").clicked() {
+                     if !self.file_path.is_empty() && self.file_path != "untitled.tex" {
+                        if let Err(e) = std::fs::write(&self.file_path, &self.editor_content) {
+                            self.compilation_log = format!("Error saving: {}\n", e);
+                        } else {
+                            self.is_dirty = false;
+                        }
+                    }
+                }
+                if ui.button("▶ Build").clicked() {
+                    self.compile();
+                }
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.heading(
@@ -2607,16 +2563,10 @@ impl eframe::App for TypesafeApp {
                             }
                         },
                         SettingsTab::APIs => {
-                            ui.heading("TeX Live Engine");
+                            ui.heading("Compilation");
                             ui.add_space(4.0);
                             if ui.checkbox(&mut self.settings.auto_compile, "Auto-compile on Save").changed() {
                                 self.settings.save();
-                            }
-                            ui.add_space(8.0);
-                            if ui.button("🗑 Clear Package Cache").clicked() {
-                                // Placeholder for clearing cache logic
-                                self.compilation_log.push_str("To clear cache manually, delete the TeX Live cache directory in your user folder.\n");
-                                self.show_log = true;
                             }
                         },
                         SettingsTab::About => {
@@ -2635,16 +2585,80 @@ impl eframe::App for TypesafeApp {
         }
         self.settings.show_settings_window = show_settings;
 
-        // ====== POP-OUT PDF VIEWER WINDOW ======
-        if self.show_pdf_popup && self.current_file_type == CurrentFileType::Pdf && self.pdf_path.is_some() {
-            let mut show_popup = true;
-            egui::Window::new("PDF Viewer")
-                .open(&mut show_popup)
-                .default_size([900.0, 700.0])
-                .vscroll(false)
-                .hscroll(false)
+        // ====== RENAME DIALOG ======
+        if self.rename_dialog_open {
+            let mut open = true;
+            egui::Window::new("Rename File")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .show(ctx, |ui| {
-                    ui.horizontal_wrapped(|ui| {
+                    ui.label(format!("Renaming: {}", self.rename_target_path.file_name().unwrap_or_default().to_string_lossy()));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.label("New Name:");
+                        let response = ui.text_edit_singleline(&mut self.rename_new_name);
+                        if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            // Pressing Enter will effectively be handled by the user clicking Rename,
+                            // or we could trigger it here.
+                        }
+                    });
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            self.rename_dialog_open = false;
+                        }
+                        if ui.button("Rename").clicked() {
+                             let new_path = self.rename_target_path.with_file_name(&self.rename_new_name);
+                             if let Err(e) = std::fs::rename(&self.rename_target_path, &new_path) {
+                                 rfd::MessageDialog::new()
+                                     .set_title("Rename Failed")
+                                     .set_description(&format!("Error: {}", e))
+                                     .show();
+                             } else {
+                                 // If we renamed the currently open file, update file_path
+                                 let old_path_str = self.rename_target_path.to_string_lossy().to_string();
+                                 let new_path_str = new_path.to_string_lossy().to_string();
+
+                                 if self.file_path == old_path_str {
+                                     self.file_path = new_path_str.clone();
+                                 }
+                                 // If we renamed the root file, update root_file
+                                 if let Some(root) = &self.root_file {
+                                     if root == &old_path_str {
+                                         self.root_file = Some(new_path_str);
+                                     }
+                                 }
+                                 self.rename_dialog_open = false;
+                             }
+                        }
+                    });
+                });
+            if !open {
+                self.rename_dialog_open = false;
+            }
+        }
+
+        // ====== POP-OUT PDF VIEWER WINDOW ======
+        if self.show_pdf_popup && self.pdf_path.is_some() {
+            let viewport_id = egui::ViewportId::from_hash_of("pdf_viewer_viewport");
+            self.pdf_popup_viewport_id = viewport_id;
+
+            let mut show_popup = true;
+            ctx.show_viewport_immediate(
+                viewport_id,
+                egui::ViewportBuilder::default()
+                    .with_title("PDF Viewer - Typesafe")
+                    .with_inner_size([900.0, 700.0]),
+                |ctx, _class| {
+                    ctx.request_repaint();
+                    if ctx.input(|i| i.viewport().close_requested()) {
+                        show_popup = false;
+                    }
+
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;
 
                         if ui.button("◀").on_hover_text("Previous Page").clicked() && self.current_page > 0 {
@@ -2714,6 +2728,7 @@ impl eframe::App for TypesafeApp {
                         if ui.button("🖨").on_hover_text("Print").clicked() {
                             self.compilation_log.push_str("Print functionality not yet implemented\n");
                         }
+                    });
 
                     if self.show_pdf_search {
                         ui.horizontal(|ui| {
@@ -2761,8 +2776,14 @@ impl eframe::App for TypesafeApp {
                                 }
                             });
                         });
-                });
-            self.show_pdf_popup = show_popup;
+                    });
+                },
+            );
+
+            if !show_popup {
+                self.show_pdf_popup = false;
+                self.pdf_textures.clear();
+            }
         }
 
         // ====== LEFT PANEL (FILES) ======
@@ -2771,7 +2792,6 @@ impl eframe::App for TypesafeApp {
                 .resizable(true)
                 .default_width(200.0)
                 .show(ctx, |ui| {
-                    ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui.add(egui::Button::new("📂").frame(false)).on_hover_text("Collapse").clicked() {
                             self.show_file_panel = false;
@@ -2885,6 +2905,12 @@ impl eframe::App for TypesafeApp {
                                                 self.root_file = Some(path.to_string_lossy().to_string());
                                                 ui.close_menu();
                                             }
+                                            if ui.button("✏ Rename").clicked() {
+                                                self.rename_target_path = path.clone();
+                                                self.rename_new_name = name.clone();
+                                                self.rename_dialog_open = true;
+                                                ui.close_menu();
+                                            }
                                             ui.separator();
                                             if ui.button("🗑 Delete File").clicked() {
                                                 if rfd::MessageDialog::new()
@@ -2906,6 +2932,13 @@ impl eframe::App for TypesafeApp {
                                             self.current_dir = path;
                                         } else if is_allowed {
                                             if ["tex", "bib", "cls", "sty", "md", "txt", "pdf"].contains(&ext.as_str()) {
+                                                // Autosave previous file
+                                                if self.settings.autosave_on_change && self.is_dirty && !self.file_path.is_empty() && self.file_path != "untitled.tex" {
+                                                    if let Err(e) = std::fs::write(&self.file_path, &self.editor_content) {
+                                                        self.compilation_log = format!("Error autosaving: {}\n", e);
+                                                    }
+                                                }
+
                                                 self.file_path = path.to_string_lossy().to_string();
                                                 let path_str = self.file_path.clone();
                                                 self.load_file(&path_str);
@@ -3402,7 +3435,6 @@ impl eframe::App for TypesafeApp {
                 .resizable(false)
                 .exact_width(32.0)
                 .show(ctx, |ui| {
-                    ui.add_space(8.0);
                     ui.vertical_centered(|ui| {
                         if ui.button("📄").on_hover_text("Expand Preview").clicked() {
                             self.show_preview_panel = true;
@@ -3427,18 +3459,32 @@ impl eframe::App for TypesafeApp {
             match self.current_file_type {
                 CurrentFileType::Pdf => {
                     // Show PDF preview in full editor area
-                    ui.add_space(8.0);
                     ui.horizontal(|ui| {
+                        if ui.add(egui::Button::new("📤").frame(false)).on_hover_text("Pop-out (Ctrl+Shift+P)").clicked() {
+                            self.show_pdf_popup = true;
+                            self.pdf_textures.clear();
+                        }
                         ui.label(
                             egui::RichText::new("PDF VIEWER")
                                 .color(theme.text_secondary)
                                 .strong(),
                         );
-                        if ui.button("📤 Pop-out").on_hover_text("Open in separate window (Ctrl+Shift+P)").clicked() {
-                            self.show_pdf_popup = true;
-                        }
                     });
                     ui.separator();
+
+                    if self.show_pdf_popup {
+                        ui.centered_and_justified(|ui| {
+                            ui.label(
+                                egui::RichText::new("PDF is open in separate window")
+                                    .color(theme.text_secondary)
+                            );
+                            if ui.button("Return to Main Window").clicked() {
+                                self.show_pdf_popup = false;
+                                self.pdf_textures.clear();
+                            }
+                        });
+                        return;
+                    }
 
                     // PDF Controls
                     ui.horizontal_wrapped(|ui| {
@@ -3511,6 +3557,7 @@ impl eframe::App for TypesafeApp {
                         if ui.button("🖨").on_hover_text("Print").clicked() {
                             self.compilation_log.push_str("Print functionality not yet implemented\n");
                         }
+                    });
 
                     if self.show_pdf_search {
                         ui.horizontal(|ui| {
@@ -3561,8 +3608,8 @@ impl eframe::App for TypesafeApp {
                     return;
                 }
                 CurrentFileType::Markdown => {
-                    ui.add_space(8.0);
                     ui.horizontal(|ui| {
+                        ui.add(egui::Button::new(" ").frame(false).sense(egui::Sense::hover()));
                         ui.label(
                             egui::RichText::new("MARKDOWN PREVIEW")
                                 .color(theme.text_secondary)
@@ -3582,8 +3629,8 @@ impl eframe::App for TypesafeApp {
                 }
                 _ => {} // Continue with normal editor for .tex files
             }
-            ui.add_space(8.0);
             ui.horizontal(|ui| {
+                ui.add(egui::Button::new(" ").frame(false).sense(egui::Sense::hover()));
                 ui.label(
                     egui::RichText::new("EDITOR")
                         .color(theme.text_secondary)
@@ -4579,65 +4626,7 @@ fn ensure_fontconfig() {
     }
 }
 
-fn locate_texlive() -> Option<String> {
-    // 1. Try to find pdflatex in PATH
-    let pdflatex_name = if cfg!(windows) { "pdflatex.exe" } else { "pdflatex" };
-    let output = std::process::Command::new("which")
-        .arg(pdflatex_name)
-        .output();
 
-    if let Ok(output) = output {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
-                return Some(path);
-            }
-        }
-    }
-
-    // 2. Check common TeX Live installation paths on Windows
-    if cfg!(windows) {
-        let common_paths = vec![
-            "C:\\texlive\\2024\\bin\\windows",
-            "C:\\texlive\\2023\\bin\\windows",
-            "C:\\texlive\\2022\\bin\\windows",
-            "C:\\Program Files\\texlive\\2024\\bin\\windows",
-        ];
-        for path in common_paths {
-            if std::path::Path::new(path).exists() {
-                return Some(path.to_string());
-            }
-        }
-    }
-
-    None
-}
-
-fn get_texlive_installer_path() -> Option<std::path::PathBuf> {
-    let installer_name = if cfg!(windows) { "install-tl-windows.exe" } else { "install-tl-unx.tar.gz" };
-
-    // 1. Check next to the executable
-    if let Ok(current_exe) = std::env::current_exe() {
-        if let Some(parent) = current_exe.parent() {
-            let candidate = parent.join(installer_name);
-            if candidate.exists() {
-                return Some(candidate);
-            }
-            let candidate_deps = parent.join("deps").join(installer_name);
-            if candidate_deps.exists() {
-                return Some(candidate_deps);
-            }
-        }
-    }
-
-    // 2. Check in deps folder from CWD
-    let deps_candidate = std::path::Path::new("deps").join(installer_name);
-    if deps_candidate.exists() {
-        return Some(deps_candidate);
-    }
-
-    None
-}
 
 fn render_pdf_page_to_texture(
     ctx: &egui::Context,

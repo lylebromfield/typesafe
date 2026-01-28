@@ -29,12 +29,12 @@ fn main() {
     let _ = fs::create_dir_all(&deps_dir);
 
     // Determine filenames based on OS
-    let (pdfium_file, texlive_installer) = if cfg!(windows) {
-        ("pdfium.dll", "install-tl-windows.exe")
+    let pdfium_file = if cfg!(windows) {
+        "pdfium.dll"
     } else if cfg!(target_os = "macos") {
-        ("libpdfium.dylib", "install-tl-unx.tar.gz")
+        "libpdfium.dylib"
     } else {
-        ("libpdfium.so", "install-tl-unx.tar.gz")
+        "libpdfium.so"
     };
 
     let pdfium_path = deps_dir.join(pdfium_file);
@@ -45,11 +45,12 @@ fn main() {
         }
     }
 
-    let texlive_path = deps_dir.join(texlive_installer);
-    if !texlive_path.exists() {
-        println!("cargo:warning=Downloading TeX Live installer...");
-        if let Err(e) = download_texlive(&deps_dir, texlive_installer) {
-            println!("cargo:warning=Failed to download TeX Live installer: {}", e);
+    let tectonic_file = if cfg!(windows) { "tectonic.exe" } else { "tectonic" };
+    let tectonic_path = deps_dir.join(tectonic_file);
+    if !tectonic_path.exists() {
+        println!("cargo:warning=Downloading Tectonic...");
+        if let Err(e) = download_tectonic(&deps_dir, tectonic_file) {
+            println!("cargo:warning=Failed to download Tectonic: {}", e);
         }
     }
 
@@ -101,29 +102,41 @@ fn download_pdfium(deps_dir: &Path, target_file: &str) -> Result<(), Box<dyn std
     Ok(())
 }
 
-
-
-fn download_texlive(deps_dir: &Path, installer_file: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn download_tectonic(deps_dir: &Path, _target_file: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let version = "0.15.0";
     let url = if cfg!(windows) {
-        "https://mirror.ctan.org/systems/texlive/tlnet/install-tl-windows.exe"
+        format!("https://github.com/tectonic-typesetting/tectonic/releases/download/tectonic@{0}/tectonic-{0}-x86_64-pc-windows-msvc.zip", version)
+    } else if cfg!(target_os = "macos") {
+        format!("https://github.com/tectonic-typesetting/tectonic/releases/download/tectonic@{0}/tectonic-{0}-x86_64-apple-darwin.tar.gz", version)
     } else {
-        "https://mirror.ctan.org/systems/texlive/tlnet/install-tl-unx.tar.gz"
+        format!("https://github.com/tectonic-typesetting/tectonic/releases/download/tectonic@{0}/tectonic-{0}-x86_64-unknown-linux-gnu.tar.gz", version)
     };
 
-    let archive_path = deps_dir.join(installer_file);
-    download_file(url, &archive_path)?;
+    let archive_name = if cfg!(windows) { "tectonic.zip" } else { "tectonic.tar.gz" };
+    let archive_path = deps_dir.join(archive_name);
 
-    // For tar.gz on Unix, extract it so it's ready to run
-    if !cfg!(windows) && installer_file.ends_with(".tar.gz") {
+    download_file(&url, &archive_path)?;
+
+    // Extract
+    if cfg!(windows) {
+        let unzip_cmd = format!(
+            "Expand-Archive -Path '{}' -DestinationPath '{}' -Force",
+            archive_path.display(), deps_dir.display()
+        );
+        let output = Command::new("powershell").args(&["-Command", &unzip_cmd]).output()?;
+        if !output.status.success() {
+            return Err(format!("Unzip failed: {}", String::from_utf8_lossy(&output.stderr)).into());
+        }
+    } else {
         let output = Command::new("tar")
             .args(&["-xzf", archive_path.to_str().unwrap(), "-C", deps_dir.to_str().unwrap()])
             .output()?;
         if !output.status.success() {
             return Err(format!("Extraction failed: {}", String::from_utf8_lossy(&output.stderr)).into());
         }
-        let _ = fs::remove_file(&archive_path);
     }
 
+    let _ = fs::remove_file(&archive_path);
     Ok(())
 }
 

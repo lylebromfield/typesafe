@@ -12,6 +12,7 @@ egui = "0.27"
 eframe = "0.27"
 epaint = "0.27"
 egui_commonmark = "0.14"
+biblatex = "0.11"
 rfd = "0.14"
 pdfium-render = { version = "0.8.37", features = ["pdfium_latest", "image_latest", "thread_safe"] }
 syntect = "5.1"
