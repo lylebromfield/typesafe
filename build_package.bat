@@ -63,6 +63,10 @@ if exist "deps\tectonic.exe" (
     echo Copying tectonic.exe to target/release...
     copy /y "deps\tectonic.exe" "target\release\" >nul
 )
+if exist "deps\biber.exe" (
+    echo Copying biber.exe to target/release...
+    copy /y "deps\biber.exe" "target\release\" >nul
+)
 if exist "deps\pdfium.dll" (
     echo Copying pdfium.dll to target/release...
     copy /y "deps\pdfium.dll" "target\release\" >nul
@@ -92,6 +96,7 @@ mkdir "release_dist\web"
 echo Copying release files...
 copy /y "target\release\typesafe.exe" "release_dist\" >nul
 if exist "deps\tectonic.exe" copy /y "deps\tectonic.exe" "release_dist\" >nul
+if exist "deps\biber.exe" copy /y "deps\biber.exe" "release_dist\" >nul
 
 if exist "deps\pdfium.dll" copy /y "deps\pdfium.dll" "release_dist\" >nul
 if exist "dictionary.txt" copy /y "dictionary.txt" "release_dist\" >nul

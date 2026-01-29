@@ -54,6 +54,15 @@ fn main() {
         }
     }
 
+    let biber_file = if cfg!(windows) { "biber.exe" } else { "biber" };
+    let biber_path = deps_dir.join(biber_file);
+    if !biber_path.exists() {
+        println!("cargo:warning=Downloading Biber...");
+        if let Err(e) = download_biber(&deps_dir, biber_file) {
+            println!("cargo:warning=Failed to download Biber: {}", e);
+        }
+    }
+
     // Tell cargo where to find native libraries
     println!("cargo:rustc-link-search=native={}", deps_dir.display());
 }
@@ -140,10 +149,48 @@ fn download_tectonic(deps_dir: &Path, _target_file: &str) -> Result<(), Box<dyn 
     Ok(())
 }
 
+fn download_biber(deps_dir: &Path, _target_file: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let version = "2.17";
+    let url = if cfg!(windows) {
+        format!("https://downloads.sourceforge.net/project/biblatex-biber/biblatex-biber/{}/binaries/Windows/biber-MSWIN64.zip", version)
+    } else if cfg!(target_os = "macos") {
+        format!("https://downloads.sourceforge.net/project/biblatex-biber/biblatex-biber/{}/binaries/OSX_Intel/biber-darwin_x86_64.tar.gz", version)
+    } else {
+        format!("https://downloads.sourceforge.net/project/biblatex-biber/biblatex-biber/{}/binaries/Linux/biber-linux_x86_64.tar.gz", version)
+    };
+
+    let archive_name = if cfg!(windows) { "biber.zip" } else { "biber.tar.gz" };
+    let archive_path = deps_dir.join(archive_name);
+
+    download_file(&url, &archive_path)?;
+
+    // Extract
+    if cfg!(windows) {
+        let unzip_cmd = format!(
+            "Expand-Archive -Path '{}' -DestinationPath '{}' -Force",
+            archive_path.display(), deps_dir.display()
+        );
+        let output = Command::new("powershell").args(&["-Command", &unzip_cmd]).output()?;
+        if !output.status.success() {
+            return Err(format!("Unzip failed: {}", String::from_utf8_lossy(&output.stderr)).into());
+        }
+    } else {
+        let output = Command::new("tar")
+            .args(&["-xzf", archive_path.to_str().unwrap(), "-C", deps_dir.to_str().unwrap()])
+            .output()?;
+        if !output.status.success() {
+            return Err(format!("Extraction failed: {}", String::from_utf8_lossy(&output.stderr)).into());
+        }
+    }
+
+    let _ = fs::remove_file(&archive_path);
+    Ok(())
+}
+
 fn download_file(url: &str, dest: &Path) -> Result<(), Box<dyn std::error::Error>> {
     if cfg!(windows) {
         let download_cmd = format!(
-            "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; $ProgressPreference = 'SilentlyContinue'; Invoke-WebRequest -Uri '{}' -OutFile '{}'",
+            "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; $ProgressPreference = 'SilentlyContinue'; Invoke-WebRequest -Uri '{}' -OutFile '{}' -UserAgent 'TypesafeBuildScript/1.0'",
             url, dest.display()
         );
         let output = Command::new("powershell").args(&["-Command", &download_cmd]).output()?;
@@ -152,7 +199,7 @@ fn download_file(url: &str, dest: &Path) -> Result<(), Box<dyn std::error::Error
         }
     } else {
         let output = Command::new("curl")
-            .args(&["-L", url, "-o", dest.to_str().unwrap()])
+            .args(&["-L", "-A", "TypesafeBuildScript/1.0", url, "-o", dest.to_str().unwrap()])
             .output()?;
         if !output.status.success() {
             return Err(format!("curl download failed: {}", String::from_utf8_lossy(&output.stderr)).into());

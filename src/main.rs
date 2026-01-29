@@ -10,6 +10,7 @@ use egui::{
 use egui::epaint::Shadow;
 use egui::text::{CCursor, CCursorRange};
 use eframe::egui;
+use sha2::{Digest, Sha256};
 use pdfium_render::prelude::*;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -388,7 +389,7 @@ enum CompilationMsg {
     #[allow(dead_code)]
     Log(String),
     Diagnostics(Vec<Diagnostic>),
-    Success(PathBuf),
+    Success(PathBuf, String, String),
     Error(String),
 }
 
@@ -566,6 +567,11 @@ struct TypesafeApp {
     #[allow(dead_code)]
     magnifier_size: f32,
 
+    // Pop-out state
+    popout_zoom: f32,
+    popout_fit_mode: PdfFitMode,
+    popout_multi_page_view: bool,
+
     // SyncTeX
     page_sizes: std::collections::HashMap<usize, (f32, f32)>,
     pending_scroll_target: Option<(usize, f32)>,
@@ -613,10 +619,15 @@ struct TypesafeApp {
     // Pop-out PDF viewer
     show_pdf_popup: bool,
     pdf_popup_viewport_id: egui::ViewportId,
+    pdf_multi_page_view: bool,
 
     // PDF search
     pdf_search_query: String,
     show_pdf_search: bool,
+
+    // Compilation Optimization
+    last_bcf_hash: String,
+    last_bib_hash: String,
 
     // File Management
     rename_dialog_open: bool,
@@ -873,7 +884,11 @@ impl Default for TypesafeApp {
             fit_mode: PdfFitMode::Normal,
             magnifier_enabled: false,
             magnifier_zoom: 2.0,
-            magnifier_size: 180.0,
+            magnifier_size: 200.0,
+
+            popout_zoom: 1.0,
+            popout_fit_mode: PdfFitMode::Normal,
+            popout_multi_page_view: false,
             compilation_log: String::new(),
             show_log: false,
             is_compiling: false,
@@ -908,8 +923,12 @@ impl Default for TypesafeApp {
             current_file_type: CurrentFileType::Tex,
             show_pdf_popup: false,
             pdf_popup_viewport_id: egui::ViewportId::ROOT,
+            pdf_multi_page_view: false,
             pdf_search_query: String::new(),
             show_pdf_search: false,
+
+            last_bcf_hash: String::new(),
+            last_bib_hash: String::new(),
 
             rename_dialog_open: false,
             rename_target_path: std::path::PathBuf::new(),
@@ -1065,7 +1084,7 @@ impl TypesafeApp {
         }
     }
 
-    fn load_file(&mut self, path: &str) {
+    fn load_file(&mut self, ctx: &egui::Context, path: &str) {
         self.current_file_type = Self::determine_file_type(path);
 
         match self.current_file_type {
@@ -1094,7 +1113,7 @@ impl TypesafeApp {
                     Ok(contents) => {
                         self.editor_content = contents;
                         self.is_dirty = false;
-                        self.compile();
+                        self.compile(ctx);
                     }
                     Err(e) => {
                         self.editor_content = format!("Error loading file: {}", e);
@@ -1104,14 +1123,14 @@ impl TypesafeApp {
         }
     }
 
-    fn save_file(&mut self, trigger_compile: bool) {
+    fn save_file(&mut self, ctx: &egui::Context, trigger_compile: bool) {
         match std::fs::write(&self.file_path, &self.editor_content) {
             Ok(_) => {
                 self.is_dirty = false;
                 self.compilation_log = "File saved successfully\n".to_string();
                 self.update_outline();
                 if self.settings.auto_compile && trigger_compile {
-                    self.compile();
+                    self.compile(ctx);
                 }
             }
             Err(e) => {
@@ -1120,10 +1139,10 @@ impl TypesafeApp {
         }
     }
 
-    fn save_file_as(&mut self) {
+    fn save_file_as(&mut self, ctx: &egui::Context) {
         if let Some(path) = rfd::FileDialog::new().add_filter("LaTeX", &["tex"]).save_file() {
             self.file_path = path.to_string_lossy().to_string();
-            self.save_file(true);
+            self.save_file(ctx, true);
         }
     }
 
@@ -1141,7 +1160,7 @@ impl TypesafeApp {
         }
     }
 
-    fn compile(&mut self) {
+    fn compile(&mut self, ctx: &egui::Context) {
         if self.settings.autosave_on_compile && self.is_dirty {
             if !self.file_path.is_empty() && self.file_path != "untitled.tex" && !self.file_path.ends_with("untitled.tex") {
                  let _ = std::fs::write(&self.file_path, &self.editor_content);
@@ -1150,12 +1169,16 @@ impl TypesafeApp {
             }
         }
         let tx = self.compile_tx.clone();
+        let ctx = ctx.clone();
         let content = self.editor_content.clone();
         let file_path = self.file_path.clone();
         let root_file = self.root_file.clone();
+        let last_bcf_hash = self.last_bcf_hash.clone();
+        let last_bib_hash = self.last_bib_hash.clone();
 
         std::thread::spawn(move || {
             let _ = tx.send(CompilationMsg::Start);
+            ctx.request_repaint();
 
             // Determine what to compile
             let target_path = if let Some(root) = root_file {
@@ -1172,6 +1195,7 @@ impl TypesafeApp {
             let clean_content = content.trim_start_matches('\u{feff}');
             if let Err(e) = std::fs::write(&save_path, clean_content) {
                 let _ = tx.send(CompilationMsg::Error(format!("Write error: {}", e)));
+                ctx.request_repaint();
                 return;
             }
 
@@ -1200,28 +1224,138 @@ impl TypesafeApp {
                 }
             }
 
-            // Determine output dir
-            let parent_dir = std::path::Path::new(&target_path).parent().unwrap_or(std::path::Path::new("."));
+            // Locate biber binary
+            let biber_name = if cfg!(windows) { "biber.exe" } else { "biber" };
+            let mut biber_path = std::path::PathBuf::from(biber_name);
 
-            let mut cmd = Command::new(tectonic_path);
-            cmd.current_dir(parent_dir)
-                .arg("-X")
-                .arg("compile")
-                .arg(&target_path)
-                .arg("--synctex")
-                .arg("--keep-intermediates")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-
-            #[cfg(windows)]
-            {
-                use std::os::windows::process::CommandExt;
-                const CREATE_NO_WINDOW: u32 = 0x08000000;
-                cmd.creation_flags(CREATE_NO_WINDOW);
+            if let Ok(current_exe) = std::env::current_exe() {
+                if let Some(parent) = current_exe.parent() {
+                    let candidate = parent.join(biber_name);
+                    if candidate.exists() {
+                        biber_path = candidate;
+                    } else {
+                        let candidate_deps = parent.join("deps").join(biber_name);
+                        if candidate_deps.exists() {
+                            biber_path = candidate_deps;
+                        } else if let Some(target_dir) = parent.parent() {
+                            if let Some(project_root) = target_dir.parent() {
+                                let dev_candidate = project_root.join("deps").join(biber_name);
+                                if dev_candidate.exists() {
+                                    biber_path = dev_candidate;
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
-            let _ = tx.send(CompilationMsg::Log("Running tectonic...".to_string()));
-            let output = cmd.output();
+            // Determine output dir
+            let parent_dir = std::path::Path::new(&target_path).parent().unwrap_or(std::path::Path::new("."));
+            let file_stem = std::path::Path::new(&target_path).file_stem().unwrap_or_default().to_string_lossy();
+
+            let run_tectonic = || {
+                let mut cmd = Command::new(&tectonic_path);
+                cmd.current_dir(parent_dir)
+                    .arg(&target_path)
+                    .arg("--synctex")
+                    .arg("--keep-intermediates")
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    const CREATE_NO_WINDOW: u32 = 0x08000000;
+                    cmd.creation_flags(CREATE_NO_WINDOW);
+                }
+                cmd.output()
+            };
+
+            let mut output;
+            let has_biblatex = content.contains("biblatex");
+
+            // Hashing helper
+            let hash_file = |path: &std::path::Path| -> String {
+                if let Ok(mut file) = std::fs::File::open(path) {
+                    let mut hasher = Sha256::new();
+                    if let Ok(_) = std::io::copy(&mut file, &mut hasher) {
+                        return format!("{:x}", hasher.finalize());
+                    }
+                }
+                String::new()
+            };
+
+            let mut current_bcf_hash = String::new();
+            let mut current_bib_hash = String::new();
+
+            // Optimistic First Pass (Full Convergence)
+            // We run Tectonic fully. Most of the time, this is all we need.
+            // If we detect that Biber was needed (citations changed), we run it and then re-run Tectonic.
+            let _ = tx.send(CompilationMsg::Log("Compiling document...".to_string()));
+            ctx.request_repaint();
+            output = run_tectonic();
+
+            if has_biblatex {
+                let bcf_path = parent_dir.join(format!("{}.bcf", file_stem));
+                if output.as_ref().map(|o| o.status.success()).unwrap_or(false) && bcf_path.exists() {
+                    // Calculate hashes
+                    current_bcf_hash = hash_file(&bcf_path);
+
+                    let mut bib_hasher = Sha256::new();
+                    if let Ok(entries) = std::fs::read_dir(parent_dir) {
+                        let mut paths: Vec<_> = entries.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().map_or(false, |e| e == "bib")).collect();
+                        paths.sort();
+                        for p in paths {
+                            if let Ok(bytes) = std::fs::read(&p) {
+                                bib_hasher.update(&bytes);
+                            }
+                        }
+                    }
+                    current_bib_hash = format!("{:x}", bib_hasher.finalize());
+
+                    let mut run_biber = true;
+                    // If hashes match previous run, we assume bibliography is stable.
+                    if current_bcf_hash == last_bcf_hash && current_bib_hash == last_bib_hash && !current_bcf_hash.is_empty() {
+                         let _ = tx.send(CompilationMsg::Log("Citations unchanged.".to_string()));
+                         ctx.request_repaint();
+                         run_biber = false;
+                    }
+
+                    if run_biber {
+                        let _ = tx.send(CompilationMsg::Log("Citations changed. Processing bibliography with Biber...".to_string()));
+                        ctx.request_repaint();
+
+                        let mut biber_cmd = Command::new(&biber_path);
+                        biber_cmd.current_dir(parent_dir)
+                            .arg(&*file_stem)
+                            .stdout(Stdio::piped())
+                            .stderr(Stdio::piped());
+
+                        #[cfg(windows)]
+                        {
+                            use std::os::windows::process::CommandExt;
+                            const CREATE_NO_WINDOW: u32 = 0x08000000;
+                            biber_cmd.creation_flags(CREATE_NO_WINDOW);
+                        }
+
+                        if let Ok(biber_out) = biber_cmd.output() {
+                            if !biber_out.status.success() {
+                                 let err = String::from_utf8_lossy(&biber_out.stderr);
+                                 let _ = tx.send(CompilationMsg::Log(format!("Biber warning/error: {}", err)));
+                                 ctx.request_repaint();
+                            }
+
+                            // Run Tectonic again to incorporate bibliography
+                            let _ = tx.send(CompilationMsg::Log("Re-compiling document to link citations...".to_string()));
+                            ctx.request_repaint();
+                            output = run_tectonic();
+                        } else {
+                             let _ = tx.send(CompilationMsg::Log("Failed to execute Biber.".to_string()));
+                             ctx.request_repaint();
+                        }
+                    }
+                }
+            }
 
             if let Ok(out) = &output {
                 let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1243,6 +1377,7 @@ impl TypesafeApp {
                 }
                 if !diagnostics.is_empty() {
                      let _ = tx.send(CompilationMsg::Diagnostics(diagnostics));
+                     ctx.request_repaint();
                 }
             }
 
@@ -1253,11 +1388,13 @@ impl TypesafeApp {
                     let pdf_path = parent_dir.join(&pdf_name);
 
                     if pdf_path.exists() {
-                        let _ = tx.send(CompilationMsg::Success(pdf_path));
+                        let _ = tx.send(CompilationMsg::Success(pdf_path, current_bcf_hash, current_bib_hash));
+                        ctx.request_repaint();
                     } else {
                         let _ = tx.send(CompilationMsg::Error(
                             "PDF file not found after compilation".to_string(),
                         ));
+                        ctx.request_repaint();
                     }
                 }
                 Ok(output) => {
@@ -1269,9 +1406,11 @@ impl TypesafeApp {
                         stdout,
                         stderr
                     )));
+                    ctx.request_repaint();
                 }
                 Err(e) => {
                     let _ = tx.send(CompilationMsg::Error(format!("Failed to run tectonic: {}", e)));
+                    ctx.request_repaint();
                 }
             }
         });
@@ -1321,6 +1460,12 @@ impl TypesafeApp {
         let active_path_buf = std::fs::canonicalize(std::path::Path::new(&self.file_path))
             .unwrap_or_else(|_| std::path::Path::new(&self.file_path).to_path_buf());
 
+        struct OutlineCounters {
+            chapter: usize,
+            figure: usize,
+            table: usize,
+        }
+
         // Recursive processor
         fn process(
             path: std::path::PathBuf,
@@ -1330,6 +1475,7 @@ impl TypesafeApp {
             labels: &mut Vec<String>,
             active_path: &std::path::Path,
             active_content: &str,
+            counters: &mut OutlineCounters,
         ) {
             let canon = std::fs::canonicalize(&path).unwrap_or(path.clone());
             if visited.contains(&canon) { return; }
@@ -1362,7 +1508,7 @@ impl TypesafeApp {
                         let mut p_str = rel.as_str().to_string();
                         if !p_str.ends_with(".tex") { p_str.push_str(".tex"); }
                         let sub_path = parent.join(&p_str);
-                        process(sub_path, p_str, visited, items, labels, active_path, active_content);
+                        process(sub_path, p_str, visited, items, labels, active_path, active_content, counters);
                     }
                 }
 
@@ -1372,6 +1518,13 @@ impl TypesafeApp {
                     let level = match type_str {
                         "part" => 0, "chapter" => 0, "section" => 1, "subsection" => 2, "subsubsection" => 3, _ => 4,
                     };
+
+                    if type_str == "chapter" {
+                        counters.chapter += 1;
+                        counters.figure = 0;
+                        counters.table = 0;
+                    }
+
                     items.push(FlatItem {
                         label: title.to_string(),
                         file: display_path.clone(),
@@ -1390,11 +1543,65 @@ impl TypesafeApp {
                         "theorem" | "lemma" | "definition" => NodeKind::Theorem,
                         _ => NodeKind::Unknown,
                     };
-                    let mut label = type_str.to_string();
+
+                    // Capitalize (e.g. "Figure")
+                    let mut chars = type_str.chars();
+                    let capitalized_type = match chars.next() {
+                        None => String::new(),
+                        Some(f) => f.to_uppercase().collect::<String>() + chars.as_str(),
+                    };
+
+                    let mut number_suffix = String::new();
+                    match type_str {
+                        "figure" => {
+                            counters.figure += 1;
+                            if counters.chapter > 0 {
+                                number_suffix = format!(" {}.{}", counters.chapter, counters.figure);
+                            } else {
+                                number_suffix = format!(" {}", counters.figure);
+                            }
+                        }
+                        "table" => {
+                            counters.table += 1;
+                            if counters.chapter > 0 {
+                                number_suffix = format!(" {}.{}", counters.chapter, counters.table);
+                            } else {
+                                number_suffix = format!(" {}", counters.table);
+                            }
+                        }
+                        _ => {}
+                    }
+
+                    let mut label = format!("{}{}", capitalized_type, number_suffix);
+                    let mut caption_found = None;
+
+                    // Check current line first
                     if let Some(cap_match) = re_caption.captures(clean_line) {
                         if let Some(c) = cap_match.get(1) {
-                            label = format!("{}: {}", type_str, c.as_str());
+                            caption_found = Some(c.as_str().to_string());
                         }
+                    }
+
+                    // If not found, scan ahead a few lines (limited scan)
+                    if caption_found.is_none() {
+                        let end_tag = format!("\\end{{{}}}", type_str);
+                        // Skip current line, take next 50 lines to find caption
+                        for ahead_line in content.lines().skip(line_idx + 1).take(50) {
+                             let clean_ahead = if let Some(idx) = ahead_line.find('%') { &ahead_line[..idx] } else { ahead_line };
+                             if clean_ahead.contains(&end_tag) {
+                                 break;
+                             }
+                             if let Some(cap_match) = re_caption.captures(clean_ahead) {
+                                if let Some(c) = cap_match.get(1) {
+                                    caption_found = Some(c.as_str().to_string());
+                                }
+                                break;
+                             }
+                        }
+                    }
+
+                    if let Some(c) = caption_found {
+                        label = format!("{}{}: {}", capitalized_type, number_suffix, c);
                     }
 
                     items.push(FlatItem {
@@ -1420,7 +1627,8 @@ impl TypesafeApp {
              self.current_dir.join(&entry_file)
         };
 
-        process(entry_path, entry_file, &mut visited, &mut all_items, &mut all_labels, &active_path_buf, &self.editor_content);
+        let mut counters = OutlineCounters { chapter: 0, figure: 0, table: 0 };
+        process(entry_path, entry_file, &mut visited, &mut all_items, &mut all_labels, &active_path_buf, &self.editor_content, &mut counters);
 
         // Build Tree
         fn insert(nodes: &mut Vec<StructureNode>, item: FlatItem) {
@@ -1975,7 +2183,7 @@ impl eframe::App for TypesafeApp {
         // Handle pending compilation
         if self.pending_autocompile {
             self.pending_autocompile = false;
-            self.compile();
+            self.compile(ctx);
         }
 
         // Load PDF if needed
@@ -1991,7 +2199,7 @@ impl eframe::App for TypesafeApp {
         if self.settings.autosave_timer && self.is_dirty {
             if now - self.last_save_time > 30.0 {
                  if !self.file_path.is_empty() && !self.file_path.ends_with("untitled.tex") {
-                     self.save_file(false);
+                     self.save_file(ctx, false);
                      self.compilation_log = "Autosaved.\n".to_string();
                  }
                  self.last_save_time = now;
@@ -2058,10 +2266,12 @@ impl eframe::App for TypesafeApp {
                 CompilationMsg::Diagnostics(diags) => {
                     self.diagnostics = diags;
                 }
-                CompilationMsg::Success(pdf_path) => {
+                CompilationMsg::Success(pdf_path, bcf_hash, bib_hash) => {
                     self.is_compiling = false;
                     self.preview_status =
                         format!("✓ Compilation success\nOutput: {}", pdf_path.display());
+                    self.last_bcf_hash = bcf_hash;
+                    self.last_bib_hash = bib_hash;
                     self.compilation_log.push_str("\nDone!");
                     self.load_pdf_preview(ctx, &pdf_path);
                 }
@@ -2079,7 +2289,7 @@ impl eframe::App for TypesafeApp {
         if ctx.input(|i| {
             i.key_pressed(egui::Key::S) && (i.modifiers.ctrl || i.modifiers.command)
         }) {
-            self.save_file(true);
+            self.save_file(ctx, true);
         }
 
         // Block Commenting (Ctrl+/)
@@ -2136,7 +2346,7 @@ impl eframe::App for TypesafeApp {
             i.key_pressed(egui::Key::B) && (i.modifiers.ctrl || i.modifiers.command)
         }) {
             if self.current_file_type == CurrentFileType::Tex && !self.is_compiling {
-                self.compile();
+                self.compile(ctx);
             }
         }
 
@@ -2177,7 +2387,7 @@ impl eframe::App for TypesafeApp {
                         let mut proceed = true;
                         if self.is_dirty {
                             if self.settings.autosave_on_change {
-                                self.save_file(false);
+                                self.save_file(ctx, false);
                             } else {
                                 let confirmed = rfd::MessageDialog::new()
                                     .set_title("Unsaved Changes")
@@ -2185,7 +2395,7 @@ impl eframe::App for TypesafeApp {
                                     .set_buttons(rfd::MessageButtons::YesNoCancel)
                                     .show();
                                 match confirmed {
-                                    rfd::MessageDialogResult::Yes => self.save_file(true),
+                                    rfd::MessageDialogResult::Yes => self.save_file(ctx, true),
                                     rfd::MessageDialogResult::No => {},
                                     rfd::MessageDialogResult::Cancel => proceed = false,
                                     _ => {},
@@ -2205,7 +2415,7 @@ impl eframe::App for TypesafeApp {
                         let mut proceed = true;
                         if self.is_dirty {
                              if self.settings.autosave_on_change {
-                                 self.save_file(false);
+                                 self.save_file(ctx, false);
                              } else {
                                  let confirmed = rfd::MessageDialog::new()
                                      .set_title("Unsaved Changes")
@@ -2213,7 +2423,7 @@ impl eframe::App for TypesafeApp {
                                      .set_buttons(rfd::MessageButtons::YesNoCancel)
                                      .show();
                                  match confirmed {
-                                     rfd::MessageDialogResult::Yes => self.save_file(true),
+                                     rfd::MessageDialogResult::Yes => self.save_file(ctx, true),
                                      rfd::MessageDialogResult::No => {},
                                      rfd::MessageDialogResult::Cancel => proceed = false,
                                      _ => {},
@@ -2224,7 +2434,7 @@ impl eframe::App for TypesafeApp {
                             if let Some(path) = rfd::FileDialog::new().add_filter("LaTeX", &["tex"]).pick_file() {
                                 self.file_path = path.to_string_lossy().to_string();
                                 let path_str = self.file_path.clone();
-                                self.load_file(&path_str);
+                                self.load_file(ctx, &path_str);
                                 self.settings.last_file = Some(self.file_path.clone());
                                 self.settings.save();
                                 if let Some(parent) = path.parent() {
@@ -2242,11 +2452,11 @@ impl eframe::App for TypesafeApp {
                     }
                     ui.separator();
                     if ui.add(egui::Button::new("Save").shortcut_text("Ctrl+S")).clicked() {
-                        self.save_file(true);
+                        self.save_file(ctx, true);
                         ui.close_menu();
                     }
                     if ui.button("Save As...").clicked() {
-                        self.save_file_as();
+                        self.save_file_as(ctx);
                         ui.close_menu();
                     }
                     ui.separator();
@@ -2405,7 +2615,7 @@ impl eframe::App for TypesafeApp {
                      });
                      ui.separator();
                      if ui.add(egui::Button::new("Build PDF").shortcut_text("Ctrl+B")).clicked() {
-                         self.compile();
+                         self.compile(ctx);
                          ui.close_menu();
                      }
                 });
@@ -2424,19 +2634,7 @@ impl eframe::App for TypesafeApp {
                     }
                 });
 
-                ui.separator();
-                if ui.button("💾 Save").clicked() {
-                     if !self.file_path.is_empty() && self.file_path != "untitled.tex" {
-                        if let Err(e) = std::fs::write(&self.file_path, &self.editor_content) {
-                            self.compilation_log = format!("Error saving: {}\n", e);
-                        } else {
-                            self.is_dirty = false;
-                        }
-                    }
-                }
-                if ui.button("▶ Build").clicked() {
-                    self.compile();
-                }
+
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.heading(
@@ -2679,54 +2877,54 @@ impl eframe::App for TypesafeApp {
 
                         ui.separator();
 
-                        let mut zoom = self.zoom;
+                        let mut zoom = self.popout_zoom;
                         if ui.button("➖").clicked() {
                             zoom = (zoom - 0.1).clamp(0.1, 5.0);
-                            self.fit_mode = PdfFitMode::Normal;
+                            self.popout_fit_mode = PdfFitMode::Normal;
                         }
                         if ui.add(egui::Slider::new(&mut zoom, 0.1..=5.0).step_by(0.05).show_value(false)).changed() {
-                            self.fit_mode = PdfFitMode::Normal;
+                            self.popout_fit_mode = PdfFitMode::Normal;
                         }
                         if ui.button("➕").clicked() {
                             zoom = (zoom + 0.1).clamp(0.1, 5.0);
-                            self.fit_mode = PdfFitMode::Normal;
+                            self.popout_fit_mode = PdfFitMode::Normal;
                         }
 
                         let mut zoom_percent = (zoom * 100.0).round() as u32;
                         if ui.add(egui::DragValue::new(&mut zoom_percent).suffix("%").clamp_range(10..=500).speed(1.0)).changed() {
                             zoom = zoom_percent as f32 / 100.0;
-                            self.fit_mode = PdfFitMode::Normal;
+                            self.popout_fit_mode = PdfFitMode::Normal;
                         }
 
-                        if (zoom - self.zoom).abs() > 0.001 {
-                            self.zoom = zoom;
+                        if (zoom - self.popout_zoom).abs() > 0.001 {
+                            self.popout_zoom = zoom;
                             self.pdf_textures.clear();
                         }
 
                         if ui.button("⟳").on_hover_text("Reset Zoom").clicked() {
-                            self.zoom = 1.0;
-                            self.fit_mode = PdfFitMode::Normal;
+                            self.popout_zoom = 1.0;
+                            self.popout_fit_mode = PdfFitMode::Normal;
                             self.pdf_textures.clear();
                         }
 
                         ui.separator();
 
                         if ui.button("↔").on_hover_text("Fit Width").clicked() {
-                            self.fit_mode = PdfFitMode::FitWidth;
+                            self.popout_fit_mode = PdfFitMode::FitWidth;
                             self.pdf_textures.clear();
                         }
                         if ui.button("⬚").on_hover_text("Fit Page").clicked() {
-                            self.fit_mode = PdfFitMode::FitPage;
+                            self.popout_fit_mode = PdfFitMode::FitPage;
                             self.pdf_textures.clear();
+                        }
+                        if ui.toggle_value(&mut self.popout_multi_page_view, "::").on_hover_text("Grid View").clicked() {
+                             self.pdf_textures.clear();
                         }
 
                         ui.separator();
 
                         if ui.button("🔍").on_hover_text("Search (Ctrl+F)").clicked() {
                             self.show_pdf_search = !self.show_pdf_search;
-                        }
-                        if ui.button("🖨").on_hover_text("Print").clicked() {
-                            self.compilation_log.push_str("Print functionality not yet implemented\n");
                         }
                     });
 
@@ -2743,25 +2941,69 @@ impl eframe::App for TypesafeApp {
 
                     ui.separator();
 
+                    // Auto-scale zoom for popout
+                    if !self.page_sizes.is_empty() && self.popout_fit_mode != PdfFitMode::Normal {
+                        if let Some((w, h)) = self.page_sizes.get(&self.current_page).or_else(|| self.page_sizes.values().next()) {
+                            let available_w = (ui.available_width() - 32.0).max(100.0);
+                            let available_h = (ui.available_height() - 32.0).max(100.0);
+
+                            if self.popout_fit_mode == PdfFitMode::FitWidth {
+                                self.popout_zoom = available_w / w;
+                            } else if self.popout_fit_mode == PdfFitMode::FitPage {
+                                let zoom_h = available_h / h;
+                                let zoom_w = available_w / w;
+                                self.popout_zoom = zoom_h.min(zoom_w);
+                            }
+                        }
+                    }
+
                     let scroll_zoom = ctx.input(|i| if i.modifiers.ctrl { i.raw_scroll_delta.y } else { 0.0 });
-                    if scroll_zoom.abs() > 0.0 {
-                        self.zoom = (self.zoom + scroll_zoom * 0.0015).clamp(0.3, 4.0);
+                    let pinch_zoom = ctx.input(|i| i.zoom_delta());
+
+                    if (scroll_zoom.abs() > 0.0 || pinch_zoom != 1.0) && ui.rect_contains_pointer(ui.max_rect()) {
+                        let mut new_zoom = self.popout_zoom;
+                        if scroll_zoom.abs() > 0.0 {
+                            new_zoom += scroll_zoom * 0.0015;
+                        }
+                        if pinch_zoom != 1.0 {
+                            new_zoom *= pinch_zoom;
+                        }
+                        self.popout_zoom = new_zoom.clamp(0.3, 4.0);
                         self.pdf_textures.clear();
                     }
 
                     egui::ScrollArea::both()
                         .id_source("pdf_popup_scroll")
                         .show(ui, |ui| {
-                            ui.vertical_centered(|ui| {
-                                if self.page_count > 0 {
-                                    for page_idx in 0..self.page_count {
-                                        self.render_page(ctx, page_idx);
+                            if self.page_count > 0 {
+                                if self.popout_multi_page_view {
+                                     ui.horizontal_wrapped(|ui| {
+                                         ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
 
-                                        if let Some(tex) = self.pdf_textures.get(&page_idx) {
-                                            if let Some([w, h]) = self.preview_size {
-                                                let aspect = w as f32 / h as f32;
-                                                let available_w = (ui.available_width() - 20.0).max(100.0);
-                                                let display_width = available_w * self.zoom;
+                                         for page_idx in 0..self.page_count {
+                                             self.render_page(ctx, page_idx);
+                                             if let Some(tex) = self.pdf_textures.get(&page_idx) {
+                                                 let (pw, ph) = self.page_sizes.get(&page_idx).copied().unwrap_or((595.0, 842.0));
+                                                 let aspect = pw / ph;
+                                                 let display_width = pw * self.popout_zoom;
+                                                 let display_height = display_width / aspect;
+
+                                                 ui.add(egui::Image::new((
+                                                     tex.id(),
+                                                     Vec2::new(display_width, display_height),
+                                                 )).sense(egui::Sense::click()));
+                                             }
+                                         }
+                                     });
+                                } else {
+                                    ui.vertical_centered(|ui| {
+                                        for page_idx in 0..self.page_count {
+                                            self.render_page(ctx, page_idx);
+
+                                            if let Some(tex) = self.pdf_textures.get(&page_idx) {
+                                                let (pw, ph) = self.page_sizes.get(&page_idx).copied().unwrap_or((595.0, 842.0));
+                                                let aspect = pw / ph;
+                                                let display_width = pw * self.popout_zoom;
                                                 let display_height = display_width / aspect;
 
                                                 ui.add(egui::Image::new((
@@ -2770,11 +3012,11 @@ impl eframe::App for TypesafeApp {
                                                 )).sense(egui::Sense::click()));
                                             }
                                         }
-                                    }
-                                } else {
-                                    ui.label("No PDF loaded");
+                                    });
                                 }
-                            });
+                            } else {
+                                ui.label("No PDF loaded");
+                            }
                         });
                     });
                 },
@@ -2829,7 +3071,7 @@ impl eframe::App for TypesafeApp {
                                     let mut proceed = true;
                                     if self.is_dirty {
                                         if self.settings.autosave_on_change {
-                                            self.save_file(false);
+                                            self.save_file(ctx, false);
                                         } else {
                                             let confirmed = rfd::MessageDialog::new()
                                                 .set_title("Unsaved Changes")
@@ -2837,7 +3079,7 @@ impl eframe::App for TypesafeApp {
                                                 .set_buttons(rfd::MessageButtons::YesNoCancel)
                                                 .show();
                                             match confirmed {
-                                                rfd::MessageDialogResult::Yes => self.save_file(true),
+                                                rfd::MessageDialogResult::Yes => self.save_file(ctx, true),
                                                 rfd::MessageDialogResult::No => {},
                                                 rfd::MessageDialogResult::Cancel => proceed = false,
                                                 _ => {},
@@ -2941,7 +3183,7 @@ impl eframe::App for TypesafeApp {
 
                                                 self.file_path = path.to_string_lossy().to_string();
                                                 let path_str = self.file_path.clone();
-                                                self.load_file(&path_str);
+                                                self.load_file(ctx, &path_str);
                                                 self.settings.last_file = Some(self.file_path.clone());
                                                 self.settings.save();
                                                 if self.current_file_type == CurrentFileType::Tex {
@@ -2995,7 +3237,15 @@ impl eframe::App for TypesafeApp {
                                         };
                                         ui.label(egui::RichText::new(type_icon).color(egui::Color32::GRAY));
 
-                                        if ui.button(egui::RichText::new(&node.label)).clicked() {
+                                        // Use a SelectableLabel or Label with truncation instead of a Button
+                                        // This allows it to shrink/truncate properly within the horizontal layout
+                                        let label_response = ui.add(
+                                            egui::Label::new(egui::RichText::new(&node.label))
+                                                .truncate(true)
+                                                .sense(egui::Sense::click())
+                                        );
+
+                                        if label_response.clicked() {
                                             // Jump to line + 1 to account for 0-indexing in outline vs 1-indexing in editor
                                             *jump_action = Some((node.file_path.clone(), node.line.saturating_sub(1)));
                                         }
@@ -3021,7 +3271,7 @@ impl eframe::App for TypesafeApp {
                                     if path_to_load.exists() {
                                          self.file_path = path_to_load.to_string_lossy().to_string();
                                          let p = self.file_path.clone();
-                                         self.load_file(&p);
+                                         self.load_file(ctx, &p);
                                          self.settings.last_file = Some(self.file_path.clone());
                                          self.settings.save();
                                     }
@@ -3153,6 +3403,9 @@ impl eframe::App for TypesafeApp {
                     if ui.button("⬚").on_hover_text("Fit Page").clicked() {
                         self.fit_mode = PdfFitMode::FitPage;
                         self.pdf_textures.clear();
+                    }
+                    if ui.toggle_value(&mut self.pdf_multi_page_view, "::").on_hover_text("Grid View").clicked() {
+                         self.pdf_textures.clear();
                     }
 
                     ui.separator();
@@ -3548,14 +3801,14 @@ impl eframe::App for TypesafeApp {
                             self.fit_mode = PdfFitMode::FitPage;
                             self.pdf_textures.clear();
                         }
+                        if ui.toggle_value(&mut self.pdf_multi_page_view, "::").on_hover_text("Grid View").clicked() {
+                             self.pdf_textures.clear();
+                        }
 
                         ui.separator();
 
                         if ui.button("🔍").on_hover_text("Search (Ctrl+F)").clicked() {
                             self.show_pdf_search = !self.show_pdf_search;
-                        }
-                        if ui.button("🖨").on_hover_text("Print").clicked() {
-                            self.compilation_log.push_str("Print functionality not yet implemented\n");
                         }
                     });
 
@@ -3573,37 +3826,64 @@ impl eframe::App for TypesafeApp {
 
                     // Display PDF
                     let scroll_zoom = ctx.input(|i| if i.modifiers.ctrl { i.raw_scroll_delta.y } else { 0.0 });
-                    if scroll_zoom.abs() > 0.0 {
-                        self.zoom = (self.zoom + scroll_zoom * 0.0015).clamp(0.3, 4.0);
+                    let pinch_zoom = ctx.input(|i| i.zoom_delta());
+
+                    if (scroll_zoom.abs() > 0.0 || pinch_zoom != 1.0) && ui.rect_contains_pointer(ui.max_rect()) {
+                        let mut new_zoom = self.zoom;
+                        if scroll_zoom.abs() > 0.0 {
+                            new_zoom += scroll_zoom * 0.0015;
+                        }
+                        if pinch_zoom != 1.0 {
+                            new_zoom *= pinch_zoom;
+                        }
+                        self.zoom = new_zoom.clamp(0.3, 4.0);
                         self.pdf_textures.clear();
                     }
 
                     egui::ScrollArea::both()
-                        .id_source("pdf_central_scroll")
+                        .id_source("pdf_preview_scroll")
                         .show(ui, |ui| {
-                            ui.vertical_centered(|ui| {
-                                if self.page_count > 0 {
-                                    for page_idx in 0..self.page_count {
-                                        self.render_page(ctx, page_idx);
+                             if self.page_count > 0 {
+                                 if self.pdf_multi_page_view {
+                                     ui.horizontal_wrapped(|ui| {
+                                         ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
 
-                                        if let Some(tex) = self.pdf_textures.get(&page_idx) {
-                                            if let Some([w, h]) = self.preview_size {
-                                                let aspect = w as f32 / h as f32;
-                                                let available_w = (ui.available_width() - 20.0).max(100.0);
-                                                let display_width = available_w * self.zoom;
-                                                let display_height = display_width / aspect;
+                                         for page_idx in 0..self.page_count {
+                                             self.render_page(ctx, page_idx);
+                                             if let Some(tex) = self.pdf_textures.get(&page_idx) {
+                                                 let (pw, ph) = self.page_sizes.get(&page_idx).copied().unwrap_or((595.0, 842.0));
+                                                 let aspect = pw / ph;
+                                                 let display_width = pw * self.zoom;
+                                                 let display_height = display_width / aspect;
 
-                                                ui.add(egui::Image::new((
-                                                    tex.id(),
-                                                    Vec2::new(display_width, display_height),
-                                                )).sense(egui::Sense::click()));
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    ui.label("No PDF loaded");
-                                }
-                            });
+                                                 ui.add(egui::Image::new((
+                                                     tex.id(),
+                                                     Vec2::new(display_width, display_height),
+                                                 )).sense(egui::Sense::click()));
+                                             }
+                                         }
+                                     });
+                                 } else {
+                                     ui.vertical_centered(|ui| {
+                                         for page_idx in 0..self.page_count {
+                                             self.render_page(ctx, page_idx);
+                                             if let Some(tex) = self.pdf_textures.get(&page_idx) {
+                                                 let (pw, ph) = self.page_sizes.get(&page_idx).copied().unwrap_or((595.0, 842.0));
+                                                 let aspect = pw / ph;
+                                                 let display_width = pw * self.zoom;
+                                                 let display_height = display_width / aspect;
+
+                                                 ui.add(egui::Image::new((
+                                                     tex.id(),
+                                                     Vec2::new(display_width, display_height),
+                                                 )).sense(egui::Sense::click()));
+                                             }
+                                         }
+                                     });
+                                 }
+                             } else {
+                                 ui.label("No PDF loaded");
+                             }
                         });
                     return;
                 }
@@ -3636,6 +3916,22 @@ impl eframe::App for TypesafeApp {
                         .color(theme.text_secondary)
                         .strong(),
                 );
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("▶ Build").clicked() {
+                        self.compile(ctx);
+                    }
+                    ui.add_space(8.0);
+                    if ui.button("💾 Save").clicked() {
+                         if !self.file_path.is_empty() && self.file_path != "untitled.tex" {
+                            if let Err(e) = std::fs::write(&self.file_path, &self.editor_content) {
+                                self.compilation_log = format!("Error saving: {}\n", e);
+                            } else {
+                                self.is_dirty = false;
+                            }
+                        }
+                    }
+                });
             });
             ui.separator();
 
@@ -3885,11 +4181,12 @@ impl eframe::App for TypesafeApp {
                         self.completion_selected_index += 1;
                     }
                 }
-                if ctx.input(|i| i.key_pressed(egui::Key::Tab) || i.key_pressed(egui::Key::Enter)) {
+                if ctx.input(|i| i.key_pressed(egui::Key::Tab) || i.key_pressed(egui::Key::Enter) || (i.key_pressed(egui::Key::Space) && i.modifiers.ctrl)) {
                     ctx.input_mut(|i| {
                         i.consume_key(egui::Modifiers::NONE, egui::Key::Enter);
                         i.consume_key(egui::Modifiers::CTRL, egui::Key::Enter);
                         i.consume_key(egui::Modifiers::NONE, egui::Key::Tab);
+                        i.consume_key(egui::Modifiers::CTRL, egui::Key::Space);
                     });
                     if let Some((_, completion)) = self.completion_suggestions.get(self.completion_selected_index).cloned() {
                         self.apply_completion(ctx, &mut text, &completion);
@@ -4575,13 +4872,13 @@ impl eframe::App for TypesafeApp {
 
                                 if btn.clicked() || (is_selected && enter_pressed) {
                                     match *name {
-                                        "Compile Project" => if !self.is_compiling { self.compile(); },
-                                        "Save File" => self.save_file(true),
+                                        "Compile Project" => if !self.is_compiling { self.compile(ctx); },
+                                        "Save File" => self.save_file(ctx, true),
                                         "Open File" => {
                                             if let Some(path) = rfd::FileDialog::new().add_filter("LaTeX", &["tex"]).pick_file() {
                                                 self.file_path = path.to_string_lossy().to_string();
                                                 let p = self.file_path.clone();
-                                                self.load_file(&p);
+                                                self.load_file(ctx, &p);
                                                 self.update_outline();
                                             }
                                         },
@@ -4669,7 +4966,11 @@ fn render_pdf_page_to_texture(
     let height_pt = page.height().value;
     page_sizes.insert(page_index, (width_pt, height_pt));
 
-    let target_width = (1400.0 * zoom).round() as i32;
+    let scale = ctx.pixels_per_point().max(1.0);
+    // Increase resolution: render at 3x scale relative to standard 72 DPI pt size
+    let width_pixels = width_pt * zoom * scale * 3.0;
+    let target_width = width_pixels.clamp(100.0, 8192.0).round() as i32;
+
     let render_config = PdfRenderConfig::new()
         .set_target_width(target_width)
         .rotate_if_landscape(PdfPageRenderRotation::Degrees90, true);
